@@ -116,6 +116,8 @@ mod test_streaming;
 mod test_attachments;
 #[cfg(test)]
 mod test_tags;
+#[cfg(test)]
+mod test_retry;
 
 #[cfg(test)]
 pub mod mock_oracle {
