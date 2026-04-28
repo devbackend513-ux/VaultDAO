@@ -62,6 +62,8 @@ export class ProposalActivityConsumer {
   private pendingFlush: boolean = false;
   private readonly metrics?: MetricsRegistry;
   private readonly notificationQueue?: NotificationPublisher;
+  /** Optional hook called after each activity record is produced — used to broadcast to realtime rooms. */
+  private readonly onActivity?: (record: ProposalActivityRecord) => void;
 
   // Persistence failure tracking
   private retryBuffer: ProposalActivityRecord[] = [];
@@ -77,6 +79,8 @@ export class ProposalActivityConsumer {
     initialBackoffMs?: number;
     metricsRegistry?: MetricsRegistry;
     notificationQueue?: NotificationPublisher;
+    /** Broadcast hook — called synchronously after each record is produced. */
+    onActivity?: (record: ProposalActivityRecord) => void;
   }) {
     this.batchSize = options?.batchSize ?? DEFAULT_BATCH_SIZE;
     this.flushIntervalMs =
@@ -85,6 +89,7 @@ export class ProposalActivityConsumer {
     this.initialBackoffMs = options?.initialBackoffMs ?? 1000;
     this.metrics = options?.metricsRegistry;
     this.notificationQueue = options?.notificationQueue;
+    this.onActivity = options?.onActivity;
   }
 
   /**
@@ -156,6 +161,9 @@ export class ProposalActivityConsumer {
 
     this.buffer.push(record);
     console.debug("[proposal-consumer] buffered record:", record.activityId);
+
+    // Broadcast to realtime rooms immediately
+    this.onActivity?.(record);
 
     // Persist via persistence if configured
     if (this.persistence) {
@@ -285,7 +293,9 @@ export class ProposalActivityConsumer {
   /**
    * Publishes notifications for key events.
    */
-  private async publishNotification(record: ProposalActivityRecord): Promise<void> {
+  private async publishNotification(
+    record: ProposalActivityRecord,
+  ): Promise<void> {
     if (!this.notificationQueue) return;
 
     let payload: any = null;
@@ -333,7 +343,10 @@ export class ProposalActivityConsumer {
           payload,
         });
       } catch (err) {
-        console.error("[proposal-consumer] failed to publish notification:", err);
+        console.error(
+          "[proposal-consumer] failed to publish notification:",
+          err,
+        );
       }
     }
   }
@@ -450,28 +463,33 @@ export class ProposalActivityConsumer {
         // // Notify batch consumers
         // for (const consumer of this.batchConsumers) { try { await consumer(records); } catch (error) { ... } }
         //
-        // This means if persistence fails, consumers are NOT notified. 
+        // This means if persistence fails, consumers are NOT notified.
         // I will follow this pattern: only notify if saveBatch succeeded (or if no persistence configured).
 
         if (!this.persistence || records.length > 0) {
-          // If we had no persistence, or we had persistence but records were cleared from this.buffer 
+          // If we had no persistence, or we had persistence but records were cleared from this.buffer
           // (meaning it didn't throw before we caught it and moved to retryBuffer)
-          
+
           // Wait, if persistence exists and saveBatch(records) SUCCEEDS, records are NOT in retryBuffer.
           // If it FAILS, they ARE in retryBuffer.
-          
+
           // Check if 'records' were successfully persisted (not in retryBuffer)
           // Actually, 'records' is a local copy. I should check if they were added to retryBuffer.
-          const persistedSuccessfully = !this.retryBuffer.some(r => records.includes(r));
-          
+          const persistedSuccessfully = !this.retryBuffer.some((r) =>
+            records.includes(r),
+          );
+
           if (persistedSuccessfully) {
-             for (const consumer of this.batchConsumers) {
-               try {
-                 await consumer(records);
-               } catch (error) {
-                 console.error("[proposal-consumer] batch consumer error during flush:", error);
-               }
-             }
+            for (const consumer of this.batchConsumers) {
+              try {
+                await consumer(records);
+              } catch (error) {
+                console.error(
+                  "[proposal-consumer] batch consumer error during flush:",
+                  error,
+                );
+              }
+            }
           }
         }
       }
@@ -608,7 +626,9 @@ export class ProposalActivityConsumer {
 
       default:
         // This should be unreachable if PROPOSAL_ACTIVITY_TYPE_MAP is correctly configured
-        console.warn(`[proposal-consumer] unhandled activity type: ${activityType}`);
+        console.warn(
+          `[proposal-consumer] unhandled activity type: ${activityType}`,
+        );
         return {
           activityType: activityType as any,
         } as any;
@@ -677,6 +697,7 @@ export function createProposalConsumer(options?: {
   flushIntervalMs?: number;
   metricsRegistry?: MetricsRegistry;
   notificationQueue?: NotificationPublisher;
+  onActivity?: (record: ProposalActivityRecord) => void;
 }): ProposalActivityConsumer {
   return new ProposalActivityConsumer(options);
 }
