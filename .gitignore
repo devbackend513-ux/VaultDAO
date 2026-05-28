@@ -47,3 +47,7 @@ backend/coverage/
 backend/*.log
 backend/logs/
 backend/.tsbuildinfo
+
+# Ignore specific files
+contract_issues.md
+issue2.md
