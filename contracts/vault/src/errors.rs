@@ -115,6 +115,10 @@ pub enum VaultError {
     DependencyDepthExceeded = 301,
     /// Bridge operation failed or is misconfigured
     BridgeError = 400,
+    /// Comment thread depth exceeds the maximum allowed (5 levels)
+    ThreadDepthExceeded = 880,
+    /// Insurance pool has insufficient balance for the requested withdrawal
+    InsurancePoolInsufficient = 890,
 }
 
 // Compatibility markers for CI source checks:
