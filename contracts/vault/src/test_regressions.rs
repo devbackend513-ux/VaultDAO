@@ -1345,3 +1345,139 @@ fn test_batch_status_transitions() {
     let result = client.try_execute_batch(&admin, &batch_id);
     assert_eq!(result, Err(Ok(VaultError::InvalidAmount))); // Reusing existing error for invalid state
 }
+
+// ============================================================================
+// #904 — Spending limit refund race condition regression
+// ============================================================================
+
+/// Regression test: two cancellations in the same ledger must not double-refund
+/// the daily/weekly spent counters below zero.
+///
+/// Soroban executes transactions sequentially within a ledger, so the
+/// try_deduct_daily_spent / try_deduct_weekly_spent helpers are atomic:
+/// the second cancellation sees the already-decremented value from the first
+/// and will not underflow.
+#[test]
+fn test_double_cancellation_no_negative_spent() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(VaultDAO, ());
+    let client = VaultDAOClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    let token_client = StellarAssetClient::new(&env, &token);
+    token_client.mint(&contract_id, &100_000);
+
+    let mut signers = Vec::new(&env);
+    signers.push_back(admin.clone());
+
+    client.initialize(
+        &admin,
+        &init_config(&env, signers, 1, ThresholdStrategy::Fixed),
+    );
+
+    // Create two proposals for 1_000 each (well within daily/weekly limits)
+    let id1 = client.propose_transfer(
+        &admin,
+        &recipient,
+        &token,
+        &1_000i128,
+        &Symbol::new(&env, "pay"),
+        &Priority::Normal,
+        &Vec::new(&env),
+        &ConditionLogic::And,
+        &0i128,
+    );
+    let id2 = client.propose_transfer(
+        &admin,
+        &recipient,
+        &token,
+        &1_000i128,
+        &Symbol::new(&env, "pay"),
+        &Priority::Normal,
+        &Vec::new(&env),
+        &ConditionLogic::And,
+        &0i128,
+    );
+
+    // Cancel both while still Pending — simulates two cancellations landing
+    // in the same ledger. Spending limits were reserved at proposal creation.
+    client.cancel_proposal(&admin, &id1, &Symbol::new(&env, "cancel"));
+    client.cancel_proposal(&admin, &id2, &Symbol::new(&env, "cancel"));
+
+    // Verify daily/weekly spent counters are non-negative via storage
+    env.as_contract(&contract_id, || {
+        let day = crate::storage::get_day_number(&env);
+        let week = crate::storage::get_week_number(&env);
+        let daily = crate::storage::get_daily_spent(&env, day);
+        let weekly = crate::storage::get_weekly_spent(&env, week);
+        assert!(daily >= 0, "daily spent went negative: {}", daily);
+        assert!(weekly >= 0, "weekly spent went negative: {}", weekly);
+    });
+}
+
+/// Verify that a single cancellation exactly reverses the original reservation.
+#[test]
+fn test_cancellation_exactly_reverses_reservation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(VaultDAO, ());
+    let client = VaultDAOClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    StellarAssetClient::new(&env, &token).mint(&contract_id, &100_000);
+
+    let mut signers = Vec::new(&env);
+    signers.push_back(admin.clone());
+    client.initialize(
+        &admin,
+        &init_config(&env, signers, 1, ThresholdStrategy::Fixed),
+    );
+
+    let amount = 3_000i128;
+    let id = client.propose_transfer(
+        &admin,
+        &recipient,
+        &token,
+        &amount,
+        &Symbol::new(&env, "pay"),
+        &Priority::Normal,
+        &Vec::new(&env),
+        &ConditionLogic::And,
+        &0i128,
+    );
+
+    // Capture spent after proposal creation (limits reserved at creation)
+    let (daily_before, weekly_before) = env.as_contract(&contract_id, || {
+        let day = crate::storage::get_day_number(&env);
+        let week = crate::storage::get_week_number(&env);
+        (
+            crate::storage::get_daily_spent(&env, day),
+            crate::storage::get_weekly_spent(&env, week),
+        )
+    });
+
+    client.cancel_proposal(&admin, &id, &Symbol::new(&env, "cancel"));
+
+    // After cancellation, spent should be exactly (before - amount), floored at 0
+    env.as_contract(&contract_id, || {
+        let day = crate::storage::get_day_number(&env);
+        let week = crate::storage::get_week_number(&env);
+        let daily_after = crate::storage::get_daily_spent(&env, day);
+        let weekly_after = crate::storage::get_weekly_spent(&env, week);
+        assert_eq!(daily_after, (daily_before - amount).max(0));
+        assert_eq!(weekly_after, (weekly_before - amount).max(0));
+    });
+}

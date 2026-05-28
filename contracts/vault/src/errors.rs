@@ -92,6 +92,18 @@ pub enum VaultError {
     UpgradeUnauthorized = 920,
     /// Contract upgrade timelock is still active
     UpgradeTimelockActive = 921,
+    /// Subscription with the given ID does not exist
+    SubscriptionNotFound = 930,
+    /// Subscription has already been cancelled
+    SubscriptionAlreadyCancelled = 931,
+    /// Renewal is not yet due
+    RenewalNotDue = 932,
+    /// Caller is not the subscriber or an admin
+    NotSubscriberOrAdmin = 933,
+    /// Subscription is not in active status
+    SubscriptionNotActive = 934,
+    /// Subscription has already expired
+    SubscriptionAlreadyExpired = 935,
 }
 
 // Additional error types that exceed contracterror limits - use generic errors above
@@ -99,11 +111,6 @@ pub enum VaultError {
 // TooManyAttachments -> BatchTooLarge  
 // TooManyTags -> BatchTooLarge
 // MetadataValueInvalid -> InvalidAmount
-// SubscriptionNotFound -> TemplateNotFound
-// SubscriptionAlreadyCancelled -> ProposalAlreadyCancelled
-// RenewalNotDue -> TimelockNotExpired
-// NotSubscriberOrAdmin -> InsufficientRole
-// SubscriptionNotActive -> TemplateInactive
 // DependencyDepthExceeded -> BatchTooLarge
 
 // Compatibility markers for CI source checks:

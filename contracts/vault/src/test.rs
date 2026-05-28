@@ -5639,6 +5639,7 @@ fn test_create_subscription() {
         &100_i128,
         &17280_u64,
         &true,
+        &0u64,
     );
 
     assert_eq!(sub_id, 1);
@@ -5683,6 +5684,7 @@ fn test_subscription_renewal() {
         &100_i128,
         &1000_u64,
         &true,
+        &0u64,
     );
 
     // Advance ledger to renewal time
@@ -6126,6 +6128,7 @@ fn test_cross_vault_multi_vault_actions() {
         &200_i128,
         &5000_u64,
         &true,
+        &0u64,
     );
 
     let result = client.try_renew_subscription(&sub_id);
@@ -6162,6 +6165,7 @@ fn test_cancel_subscription() {
         &500_i128,
         &10000_u64,
         &true,
+        &0u64,
     );
 
     client.cancel_subscription(&subscriber, &sub_id);
@@ -6199,6 +6203,7 @@ fn test_cancel_subscription_unauthorized() {
         &50_i128,
         &2000_u64,
         &false,
+        &0u64,
     );
 
     let result = client.try_cancel_subscription(&unauthorized, &sub_id);
@@ -6233,6 +6238,7 @@ fn test_upgrade_subscription() {
         &100_i128,
         &5000_u64,
         &true,
+        &0u64,
     );
 
     client.upgrade_subscription(&subscriber, &sub_id, &SubscriptionTier::Premium, &300_i128);
@@ -6275,6 +6281,7 @@ fn test_subscription_payment_tracking() {
         &100_i128,
         &1000_u64,
         &true,
+        &0u64,
     );
 
     for _i in 1..=3 {
@@ -6319,6 +6326,7 @@ fn test_get_subscriber_subscriptions() {
         &50_i128,
         &2000_u64,
         &true,
+        &0u64,
     );
 
     let sub_id2 = client.create_subscription(
@@ -6329,6 +6337,7 @@ fn test_get_subscriber_subscriptions() {
         &250_i128,
         &3000_u64,
         &true,
+        &0u64,
     );
 
     let subscriptions = client.get_subscriber_subscriptions(&subscriber);
@@ -6365,6 +6374,7 @@ fn test_subscription_invalid_amount() {
         &0_i128,
         &1000_u64,
         &true,
+        &0u64,
     );
     assert_eq!(result.err(), Some(Ok(VaultError::InvalidAmount)));
 }
@@ -6397,6 +6407,7 @@ fn test_subscription_interval_too_short() {
         &100_i128,
         &500_u64,
         &true,
+        &0u64,
     );
     assert_eq!(result.err(), Some(Ok(VaultError::IntervalTooShort)));
 }
@@ -6429,6 +6440,7 @@ fn test_renew_cancelled_subscription_fails() {
         &100_i128,
         &1000_u64,
         &true,
+        &0u64,
     );
 
     client.cancel_subscription(&subscriber, &sub_id);
@@ -6469,6 +6481,7 @@ fn test_subscription_tier_management() {
         &50_i128,
         &2000_u64,
         &true,
+        &0u64,
     );
 
     client.upgrade_subscription(&subscriber, &sub_id, &SubscriptionTier::Standard, &100_i128);
