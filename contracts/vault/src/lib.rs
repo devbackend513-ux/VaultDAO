@@ -6098,28 +6098,6 @@ impl VaultDAO {
                         };
                         if !satisfied {
                             return Err(VaultError::ConditionsNotMet);
-        for i in 0..proposal.conditions.len() {
-            if let Some(cond) = proposal.conditions.get(i) {
-                let satisfied = match cond {
-                    Condition::BalanceAbove(min_balance) => {
-                        token::balance(env, &proposal.token) > min_balance
-                    }
-                    Condition::DateAfter(after_ledger) => current_ledger > after_ledger,
-                    Condition::DateBefore(before_ledger) => current_ledger < before_ledger,
-                    Condition::PriceAbove(asset, threshold) => {
-                        match Self::get_asset_price(env, asset.clone()) {
-                            Ok(price) => price >= threshold,
-                            Err(VaultError::OraclePriceStale) => return Err(VaultError::OraclePriceStale),
-                            Err(VaultError::OracleNotConfigured) => return Err(VaultError::OracleNotConfigured),
-                            Err(_) => false,
-                        }
-                    }
-                    Condition::PriceBelow(asset, threshold) => {
-                        match Self::get_asset_price(env, asset.clone()) {
-                            Ok(price) => price <= threshold,
-                            Err(VaultError::OraclePriceStale) => return Err(VaultError::OraclePriceStale),
-                            Err(VaultError::OracleNotConfigured) => return Err(VaultError::OracleNotConfigured),
-                            Err(_) => false,
                         }
                     }
                 }
