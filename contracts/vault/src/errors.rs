@@ -96,6 +96,18 @@ pub enum VaultError {
     UpgradeUnauthorized = 920,
     /// Contract upgrade timelock is still active
     UpgradeTimelockActive = 921,
+    /// Veto window has closed
+    VetoWindowClosed = 930,
+    /// Proposal status transition is not valid
+    InvalidStatusTransition = 940,
+    /// Dependency proposal was executed in the same ledger
+    DependencyNotExecuted = 950,
+    /// Recurring payment is paused
+    RecurringPaymentPaused = 1000,
+    /// Recurring payment is stopped and cannot be resumed
+    RecurringPaymentStopped = 1001,
+    /// A config change proposal is already pending
+    ConfigChangeInProgress = 1010,
 }
 
 // Additional error types that exceed contracterror limits - use generic errors above

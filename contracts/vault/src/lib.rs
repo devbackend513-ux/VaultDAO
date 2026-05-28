@@ -426,7 +426,7 @@ impl VaultDAO {
         Self::validate_recipient(&env, &recipient)?;
 
         // 5. Velocity Limit Check (Sliding Window)
-        if !storage::check_and_update_velocity(&env, &proposer, &config.velocity_limit) {
+        if !storage::check_and_update_velocity(&env, &proposer, &token_addr, &config.velocity_limit) {
             return Err(VaultError::VelocityLimitExceeded);
         }
 
@@ -611,6 +611,7 @@ impl VaultDAO {
             } else {
                 0
             },
+            execution_ledger: 0,
         };
 
         storage::set_proposal(&env, &proposal);
@@ -700,8 +701,13 @@ impl VaultDAO {
             return Err(VaultError::InsufficientRole);
         }
 
-        // Velocity check once for the batch
-        if !storage::check_and_update_velocity(&env, &proposer, &config.velocity_limit) {
+        // Velocity check once for the batch (use first transfer token for per-token tracking)
+        let batch_token = if transfers.is_empty() {
+            return Err(VaultError::InvalidAmount);
+        } else {
+            transfers.get(0).unwrap().token.clone()
+        };
+        if !storage::check_and_update_velocity(&env, &proposer, &batch_token, &config.velocity_limit) {
             return Err(VaultError::VelocityLimitExceeded);
         }
 
@@ -839,6 +845,7 @@ impl VaultDAO {
                 } else {
                     0
                 },
+                execution_ledger: 0,
             };
 
             storage::set_proposal(&env, &proposal);
@@ -1259,7 +1266,7 @@ impl VaultDAO {
         // Get proposal
         let mut proposal = storage::get_proposal(&env, proposal_id)?;
 
-        // Validate state
+        // Validate state via state machine
         if proposal.status == ProposalStatus::Executed {
             return Err(VaultError::ProposalAlreadyExecuted);
         }
@@ -1301,11 +1308,15 @@ impl VaultDAO {
             return Err(VaultError::TimelockNotExpired);
         }
 
-        // Dependencies must be fully executed before this proposal can execute.
+        // Dependencies must be fully executed before this proposal can execute,
+        // and must have been executed in a prior ledger (not the same ledger batch).
         for dependency_id in proposal.depends_on.iter() {
             if let Ok(dep_proposal) = storage::get_proposal(&env, dependency_id) {
                 if dep_proposal.status != ProposalStatus::Executed {
                     return Err(VaultError::ProposalNotApproved);
+                }
+                if dep_proposal.execution_ledger == 0 || dep_proposal.execution_ledger >= current_ledger {
+                    return Err(VaultError::DependencyNotExecuted);
                 }
             } else {
                 return Err(VaultError::ProposalNotFound);
@@ -1359,8 +1370,28 @@ impl VaultDAO {
 
                 // Update proposal status
                 proposal.status = ProposalStatus::Executed;
+                proposal.execution_ledger = current_ledger;
                 storage::set_proposal(&env, &proposal);
                 storage::extend_instance_ttl(&env);
+
+                // If this is a config change proposal, apply the pending config
+                if proposal.memo == Symbol::new(&env, "config_change") {
+                    if let Some(pending_id) = storage::get_pending_config_proposal(&env) {
+                        if pending_id == proposal_id {
+                            let stored: Option<Config> = env
+                                .storage()
+                                .persistent()
+                                .get(&crate::storage::FeatureKey::PendingConfig);
+                            if let Some(new_config) = stored {
+                                storage::set_config(&env, &new_config);
+                            }
+                            storage::clear_pending_config_proposal(&env);
+                            env.storage()
+                                .persistent()
+                                .remove(&crate::storage::FeatureKey::PendingConfig);
+                        }
+                    }
+                }
 
                 // Emit execution event (rich: includes token and ledger)
                 events::emit_proposal_executed(
@@ -1512,6 +1543,7 @@ impl VaultDAO {
             {
                 // Mark executed and store transfer details for potential rollback
                 proposal.status = ProposalStatus::Executed;
+                proposal.execution_ledger = env.ledger().sequence() as u64;
                 storage::set_proposal(&env, &proposal);
                 executed_transfers.push_back((
                     pid,
@@ -1981,8 +2013,11 @@ impl VaultDAO {
             return Err(VaultError::ProposalAlreadyCancelled);
         }
 
-        // Guard: only Pending proposals can be cancelled
-        if proposal.status != ProposalStatus::Pending {
+        // Guard: only Pending, Approved, or Scheduled proposals can be cancelled
+        if proposal.status != ProposalStatus::Pending
+            && proposal.status != ProposalStatus::Approved
+            && proposal.status != ProposalStatus::Scheduled
+        {
             return Err(VaultError::ProposalNotPending);
         }
 
@@ -2098,6 +2133,18 @@ impl VaultDAO {
                             &proposal.proposer,
                             proposal.stake_amount,
                         );
+                    }
+                }
+            }
+
+            // Clear pending config if this was a config change proposal
+            if proposal.memo == Symbol::new(&env, "config_change") {
+                if let Some(pending_id) = storage::get_pending_config_proposal(&env) {
+                    if pending_id == proposal_id {
+                        storage::clear_pending_config_proposal(&env);
+                        env.storage()
+                            .persistent()
+                            .remove(&crate::storage::FeatureKey::PendingConfig);
                     }
                 }
             }
@@ -2441,8 +2488,7 @@ impl VaultDAO {
                 timelock_delay: 0,
                 velocity_limit: VelocityConfig {
                     limit: 0,
-                    window: 0,
-                },
+                    window: 0, per_token_limit: 0 },
                 threshold_strategy: ThresholdStrategy::Fixed,
                 pre_execution_hooks: Vec::new(&env),
                 post_execution_hooks: Vec::new(&env),
@@ -2673,6 +2719,53 @@ impl VaultDAO {
         storage::get_proposal(&env, proposal_id)
     }
 
+    /// Return the given proposals sorted by execution_ledger (ascending).
+    ///
+    /// Only proposals with status == Executed are included in the sort.
+    /// Proposals that are not yet executed (execution_ledger == 0) are appended
+    /// at the end in their original order.
+    ///
+    /// # Arguments
+    /// * `proposal_ids` - IDs of proposals to sort.
+    pub fn get_execution_order(env: Env, proposal_ids: Vec<u64>) -> Result<Vec<Proposal>, VaultError> {
+        let mut executed: Vec<Proposal> = Vec::new(&env);
+        let mut pending: Vec<Proposal> = Vec::new(&env);
+
+        for i in 0..proposal_ids.len() {
+            let id = proposal_ids.get(i).unwrap();
+            let proposal = storage::get_proposal(&env, id)?;
+            if proposal.status == ProposalStatus::Executed && proposal.execution_ledger > 0 {
+                executed.push_back(proposal);
+            } else {
+                pending.push_back(proposal);
+            }
+        }
+
+        // Insertion sort by execution_ledger (ascending)
+        let n = executed.len();
+        for i in 1..n {
+            let mut j = i;
+            while j > 0 {
+                let a = executed.get(j - 1).unwrap();
+                let b = executed.get(j).unwrap();
+                if a.execution_ledger > b.execution_ledger {
+                    executed.set(j - 1, b);
+                    executed.set(j, a);
+                    j -= 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Append non-executed proposals at the end
+        for i in 0..pending.len() {
+            executed.push_back(pending.get(i).unwrap());
+        }
+
+        Ok(executed)
+    }
+
     /// List proposal IDs in ascending creation order (paginated).
     ///
     /// Returns up to `limit` proposal IDs, skipping the first `offset` entries.
@@ -2789,6 +2882,7 @@ impl VaultDAO {
             } else {
                 0
             },
+            execution_ledger: 0,
         };
 
         storage::set_proposal(&env, &proposal);
@@ -2904,6 +2998,116 @@ impl VaultDAO {
         storage::extend_instance_ttl(&env);
         let config = storage::get_config(&env)?;
         Ok(config.signers)
+    }
+
+    /// Propose a configuration change that requires multi-sig approval.
+    ///
+    /// Creates a special proposal with memo = "config_change". The proposed
+    /// config is stored under `FeatureKey::PendingConfig` keyed by proposal ID.
+    /// Only one config change proposal can be active (Pending) at a time.
+    ///
+    /// On execution the new config is validated and applied via `set_config`.
+    ///
+    /// # Errors
+    /// - [`VaultError::ConfigChangeInProgress`] if another config change is already pending.
+    /// - [`VaultError::InsufficientRole`] if proposer is not Treasurer or Admin.
+    pub fn propose_config_change(
+        env: Env,
+        proposer: Address,
+        new_config: Config,
+    ) -> Result<u64, VaultError> {
+        proposer.require_auth();
+
+        let role = storage::get_role(&env, &proposer);
+        if role != Role::Treasurer && role != Role::Admin {
+            return Err(VaultError::InsufficientRole);
+        }
+
+        // Only one config change proposal can be active at a time
+        if storage::get_pending_config_proposal(&env).is_some() {
+            return Err(VaultError::ConfigChangeInProgress);
+        }
+
+        // Validate the proposed config (same checks as initialize)
+        Self::validate_config(&new_config)?;
+
+        let current_config = storage::get_config(&env)?;
+        let current_ledger = env.ledger().sequence() as u64;
+        let proposal_id = storage::increment_proposal_id(&env);
+
+        let proposal = Proposal {
+            id: proposal_id,
+            proposer: proposer.clone(),
+            recipient: proposer.clone(), // no transfer recipient
+            token: current_config.signers.get(0).unwrap_or(proposer.clone()),
+            amount: 0,
+            memo: Symbol::new(&env, "config_change"),
+            metadata: Map::new(&env),
+            tags: Vec::new(&env),
+            approvals: Vec::new(&env),
+            abstentions: Vec::new(&env),
+            attachments: Vec::new(&env),
+            status: ProposalStatus::Pending,
+            priority: Priority::Normal,
+            conditions: Vec::new(&env),
+            condition_logic: ConditionLogic::And,
+            created_at: current_ledger,
+            expires_at: current_ledger + PROPOSAL_EXPIRY_LEDGERS,
+            unlock_ledger: 0,
+            execution_time: None,
+            insurance_amount: 0,
+            stake_amount: 0,
+            gas_limit: 0,
+            gas_used: 0,
+            snapshot_ledger: current_ledger,
+            snapshot_signers: current_config.signers.clone(),
+            depends_on: Vec::new(&env),
+            is_swap: false,
+            voting_deadline: if current_config.default_voting_deadline > 0 {
+                current_ledger + current_config.default_voting_deadline
+            } else {
+                0
+            },
+            execution_ledger: 0,
+        };
+
+        storage::set_proposal(&env, &proposal);
+        storage::add_to_priority_queue(&env, Priority::Normal as u32, proposal_id);
+
+        // Store the pending config data in persistent storage
+        env.storage()
+            .persistent()
+            .set(&crate::storage::FeatureKey::PendingConfig, &new_config);
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &crate::storage::FeatureKey::PendingConfig,
+                crate::storage::PROPOSAL_TTL / 2,
+                crate::storage::PROPOSAL_TTL,
+            );
+
+        // Mark that a config change is in progress (stores proposal_id in instance)
+        storage::set_pending_config_proposal(&env, proposal_id);
+        storage::extend_instance_ttl(&env);
+
+        Ok(proposal_id)
+    }
+
+    /// Validate a Config struct using the same rules as initialize.
+    fn validate_config(config: &Config) -> Result<(), VaultError> {
+        if config.signers.is_empty() {
+            return Err(VaultError::NoSigners);
+        }
+        if config.threshold < 1 || config.threshold > config.signers.len() {
+            return Err(VaultError::ThresholdTooHigh);
+        }
+        if config.quorum > config.signers.len() {
+            return Err(VaultError::QuorumTooHigh);
+        }
+        if config.spending_limit <= 0 || config.daily_limit <= 0 || config.weekly_limit <= 0 {
+            return Err(VaultError::InvalidAmount);
+        }
+        Ok(())
     }
 
     /// Assign a role to an address.
@@ -3122,8 +3326,9 @@ impl VaultDAO {
             interval,
             next_payment_ledger: current_ledger + interval,
             payment_count: 0,
-            is_active: true,
+            status: crate::types::RecurringStatus::Active,
             max_missed_payments,
+            paused_at_ledger: 0,
         };
 
         storage::set_recurring_payment(&env, &payment);
@@ -3137,8 +3342,11 @@ impl VaultDAO {
     pub fn execute_recurring_payment(env: Env, payment_id: u64) -> Result<(), VaultError> {
         let mut payment = storage::get_recurring_payment(&env, payment_id)?;
 
-        if !payment.is_active {
-            return Err(VaultError::ProposalNotFound); // Or specific "NotActive" error
+        if payment.status == crate::types::RecurringStatus::Stopped {
+            return Err(VaultError::ProposalNotFound);
+        }
+        if payment.status == crate::types::RecurringStatus::Paused {
+            return Err(VaultError::RecurringPaymentPaused);
         }
 
         let current_ledger = env.ledger().sequence() as u64;
@@ -3288,7 +3496,87 @@ impl VaultDAO {
             return Err(VaultError::Unauthorized);
         }
 
-        payment.is_active = false;
+        payment.status = crate::types::RecurringStatus::Stopped;
+        storage::set_recurring_payment(&env, &payment);
+        storage::extend_instance_ttl(&env);
+
+        Ok(())
+    }
+
+    /// Pause a recurring payment temporarily.
+    ///
+    /// Only the original proposer or an Admin can pause.
+    /// Paused payments cannot be executed; the paused duration does not count
+    /// toward the schedule (next_payment_ledger is advanced on resume).
+    ///
+    /// # Errors
+    /// - [`VaultError::ProposalNotFound`] if the payment does not exist.
+    /// - [`VaultError::Unauthorized`] if caller is neither proposer nor Admin.
+    /// - [`VaultError::RecurringPaymentStopped`] if the payment is already stopped.
+    pub fn pause_recurring_payment(
+        env: Env,
+        caller: Address,
+        payment_id: u64,
+    ) -> Result<(), VaultError> {
+        caller.require_auth();
+
+        let mut payment = storage::get_recurring_payment(&env, payment_id)?;
+
+        let role = storage::get_role(&env, &caller);
+        if caller != payment.proposer && role != Role::Admin {
+            return Err(VaultError::Unauthorized);
+        }
+
+        if payment.status == crate::types::RecurringStatus::Stopped {
+            return Err(VaultError::RecurringPaymentStopped);
+        }
+
+        payment.status = crate::types::RecurringStatus::Paused;
+        payment.paused_at_ledger = env.ledger().sequence() as u64;
+        storage::set_recurring_payment(&env, &payment);
+        storage::extend_instance_ttl(&env);
+
+        Ok(())
+    }
+
+    /// Resume a paused recurring payment.
+    ///
+    /// Advances `next_payment_ledger` by the paused duration so the paused
+    /// time does not count toward the schedule.
+    ///
+    /// # Errors
+    /// - [`VaultError::ProposalNotFound`] if the payment does not exist.
+    /// - [`VaultError::Unauthorized`] if caller is neither proposer nor Admin.
+    /// - [`VaultError::RecurringPaymentStopped`] if the payment is stopped.
+    pub fn resume_recurring_payment(
+        env: Env,
+        caller: Address,
+        payment_id: u64,
+    ) -> Result<(), VaultError> {
+        caller.require_auth();
+
+        let mut payment = storage::get_recurring_payment(&env, payment_id)?;
+
+        let role = storage::get_role(&env, &caller);
+        if caller != payment.proposer && role != Role::Admin {
+            return Err(VaultError::Unauthorized);
+        }
+
+        if payment.status == crate::types::RecurringStatus::Stopped {
+            return Err(VaultError::RecurringPaymentStopped);
+        }
+
+        if payment.status == crate::types::RecurringStatus::Active {
+            // Already active — nothing to do
+            return Ok(());
+        }
+
+        // Advance next_payment_ledger by the paused duration
+        let current_ledger = env.ledger().sequence() as u64;
+        let paused_duration = current_ledger.saturating_sub(payment.paused_at_ledger);
+        payment.next_payment_ledger = payment.next_payment_ledger.saturating_add(paused_duration);
+        payment.status = crate::types::RecurringStatus::Active;
+        payment.paused_at_ledger = 0;
         storage::set_recurring_payment(&env, &payment);
         storage::extend_instance_ttl(&env);
 
@@ -4959,6 +5247,7 @@ impl VaultDAO {
 
     /// Ensure all dependencies are executed and no circular references exist.
     fn ensure_dependencies_executable(env: &Env, proposal: &Proposal) -> Result<(), VaultError> {
+        let current_ledger = env.ledger().sequence() as u64;
         for i in 0..proposal.depends_on.len() {
             let dependency_id = proposal.depends_on.get(i).unwrap();
 
@@ -4977,6 +5266,9 @@ impl VaultDAO {
                 .map_err(|_| VaultError::ProposalNotFound)?;
             if dependency.status != ProposalStatus::Executed {
                 return Err(VaultError::ProposalNotApproved);
+            }
+            if dependency.execution_ledger == 0 || dependency.execution_ledger >= current_ledger {
+                return Err(VaultError::DependencyNotExecuted);
             }
         }
 
@@ -5014,6 +5306,39 @@ impl VaultDAO {
         }
 
         Ok(false)
+    }
+
+    /// Validate that a proposal status transition is allowed by the state machine.
+    ///
+    /// Valid transitions:
+    ///   Pending  → Approved, Expired, Cancelled, Rejected, Vetoed
+    ///   Approved → Executed, Scheduled, Cancelled
+    ///   Scheduled → Executed, Cancelled
+    ///
+    /// All other transitions return `VaultError::InvalidStatusTransition`.
+    /// This is a pure function with no storage access.
+    pub fn validate_status_transition(
+        from: ProposalStatus,
+        to: ProposalStatus,
+    ) -> Result<(), VaultError> {
+        let valid = match (&from, &to) {
+            (ProposalStatus::Pending, ProposalStatus::Approved) => true,
+            (ProposalStatus::Pending, ProposalStatus::Expired) => true,
+            (ProposalStatus::Pending, ProposalStatus::Cancelled) => true,
+            (ProposalStatus::Pending, ProposalStatus::Rejected) => true,
+            (ProposalStatus::Pending, ProposalStatus::Vetoed) => true,
+            (ProposalStatus::Approved, ProposalStatus::Executed) => true,
+            (ProposalStatus::Approved, ProposalStatus::Scheduled) => true,
+            (ProposalStatus::Approved, ProposalStatus::Cancelled) => true,
+            (ProposalStatus::Scheduled, ProposalStatus::Executed) => true,
+            (ProposalStatus::Scheduled, ProposalStatus::Cancelled) => true,
+            _ => false,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(VaultError::InvalidStatusTransition)
+        }
     }
 
     /// Slash (or fully return) insurance on proposal rejection.
@@ -5745,6 +6070,7 @@ impl VaultDAO {
             } else {
                 0
             },
+            execution_ledger: 0,
         };
 
         storage::set_proposal(&env, &proposal);
@@ -6872,7 +7198,7 @@ impl VaultDAO {
         let config = storage::get_config(&env)?;
 
         // Velocity limit check
-        if !storage::check_and_update_velocity(&env, &proposer, &config.velocity_limit) {
+        if !storage::check_and_update_velocity(&env, &proposer, &template.token, &config.velocity_limit) {
             return Err(VaultError::VelocityLimitExceeded);
         }
 
@@ -6951,6 +7277,7 @@ impl VaultDAO {
             depends_on: Vec::new(&env),
             is_swap: false,
             voting_deadline: 0,
+            execution_ledger: 0,
         };
 
         storage::set_proposal(&env, &proposal);
@@ -8822,6 +9149,7 @@ impl VaultDAO {
             } else {
                 0
             },
+            execution_ledger: 0,
         };
 
         storage::set_proposal(&env, &proposal);
@@ -9470,6 +9798,7 @@ impl VaultDAO {
             } else {
                 0
             },
+            execution_ledger: 0,
         };
 
         storage::set_proposal(&env, &proposal);
@@ -9723,6 +10052,7 @@ impl VaultDAO {
             depends_on: Vec::new(&env),
             is_swap: false,
             voting_deadline: 0,
+            execution_ledger: 0,
         };
 
         storage::set_proposal(&env, &proposal);
@@ -9869,7 +10199,7 @@ impl VaultDAO {
         Self::validate_recipient(&env, &recipient)?;
 
         // Check velocity limits
-        if !storage::check_and_update_velocity(&env, &proposer, &config.velocity_limit) {
+        if !storage::check_and_update_velocity(&env, &proposer, &source_proposal.token, &config.velocity_limit) {
             return Err(VaultError::VelocityLimitExceeded);
         }
 
@@ -9936,6 +10266,7 @@ impl VaultDAO {
             } else {
                 0
             },
+            execution_ledger: 0,
         };
 
         storage::set_proposal(&env, &new_proposal);
