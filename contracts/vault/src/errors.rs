@@ -1,3 +1,4 @@
+```rust
 //! VaultDAO error definitions.
 
 use soroban_sdk::contracterror;
@@ -88,15 +89,23 @@ pub enum VaultError {
     TemplateValidationFailed = 212,
     /// Invalid time-based threshold configuration
     InvalidThresholdConfig = 310,
+
+    /// Delegation cycle detected
+    CircularDelegation = 330,
+
+    /// Delegation chain exceeds maximum depth
+    DelegationChainTooLong = 331,
+
     /// Contract upgrade is not authorized
     UpgradeUnauthorized = 920,
+
     /// Contract upgrade timelock is still active
     UpgradeTimelockActive = 921,
 }
 
 // Additional error types that exceed contracterror limits - use generic errors above
 // AttachmentHashInvalid -> InvalidAmount
-// TooManyAttachments -> BatchTooLarge  
+// TooManyAttachments -> BatchTooLarge
 // TooManyTags -> BatchTooLarge
 // MetadataValueInvalid -> InvalidAmount
 // SubscriptionNotFound -> TemplateNotFound
@@ -108,3 +117,4 @@ pub enum VaultError {
 
 // Compatibility markers for CI source checks:
 // DelegationError, DelegationChainTooLong, CircularDelegation
+```

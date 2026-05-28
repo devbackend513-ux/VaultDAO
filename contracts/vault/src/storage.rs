@@ -2250,3 +2250,75 @@ pub fn get_metrics_for_period(env: &Env, from_week: u64, to_week: u64) -> VaultM
     }
     agg
 }
+
+// ============================================================
+// Delegation Storage Helpers
+// ============================================================
+
+pub fn get_delegation(env: &Env, delegator: &Address) -> Delegation {
+    env.storage()
+        .instance()
+        .get(&DataKey::Delegation(delegator.clone()))
+        .unwrap_or(Delegation {
+            delegator: delegator.clone(),
+            delegate: delegator.clone(),
+            created_at: 0,
+            expiry_ledger: 0,
+            is_active: false,
+        })
+}
+
+pub fn set_delegation(env: &Env, delegation: &Delegation) {
+    env.storage()
+        .instance()
+        .set(&DataKey::Delegation(delegation.delegator.clone()), delegation);
+}
+
+pub fn remove_delegation(env: &Env, delegator: &Address) {
+    env.storage()
+        .instance()
+        .remove(&DataKey::Delegation(delegator.clone()));
+}
+
+pub fn get_delegators_for(env: &Env, delegate: &Address) -> Vec<Address> {
+    env.storage()
+        .instance()
+        .get(&DataKey::DelegatorsFor(delegate.clone()))
+        .unwrap_or(Vec::new(env))
+}
+
+pub fn add_delegator_index(env: &Env, delegate: &Address, delegator: &Address) {
+    let mut list: Vec<Address> = env
+        .storage()
+        .instance()
+        .get(&DataKey::DelegatorsFor(delegate.clone()))
+        .unwrap_or(Vec::new(env));
+
+    if !list.contains(delegator) {
+        list.push_back(delegator.clone());
+    }
+
+    env.storage()
+        .instance()
+        .set(&DataKey::DelegatorsFor(delegate.clone()), &list);
+}
+
+pub fn remove_delegator_index(env: &Env, delegate: &Address, delegator: &Address) {
+    let mut list: Vec<Address> = env
+        .storage()
+        .instance()
+        .get(&DataKey::DelegatorsFor(delegate.clone()))
+        .unwrap_or(Vec::new(env));
+
+    let mut updated = Vec::new(env);
+
+    for d in list.iter() {
+        if d != *delegator {
+            updated.push_back(d);
+        }
+    }
+
+    env.storage()
+        .instance()
+        .set(&DataKey::DelegatorsFor(delegate.clone()), &updated);
+}
