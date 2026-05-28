@@ -100,6 +100,10 @@ pub enum VaultError {
     MetadataValueInvalid = 832,
     /// Scheduled proposal execution window has expired
     ExecutionWindowExpired = 870,
+    /// Attachment CID already exists on this proposal
+    AttachmentAlreadyExists = 860,
+    /// Attachment CID format is invalid (must be CIDv0 "Qm…" or CIDv1 "bafy…")
+    AttachmentHashInvalid = 861,
 }
 
 // Additional error types that exceed contracterror limits - use generic errors above

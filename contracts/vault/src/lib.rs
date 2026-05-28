@@ -1355,6 +1355,8 @@ impl VaultDAO {
                 storage::tag_index_prune_proposal(&env, &proposal.tags, proposal_id);
                 storage::set_proposal(&env, &proposal);
                 storage::extend_instance_ttl(&env);
+                // Reclaim storage: clear attachment list after execution.
+                storage::set_attachments(&env, proposal_id, &Vec::new(&env));
                 events::emit_proposal_executed(
                     &env,
                     proposal_id,
@@ -4307,24 +4309,45 @@ impl VaultDAO {
 
         let proposal = storage::get_proposal(&env, proposal_id)?;
 
+        if proposal.status != ProposalStatus::Pending {
+            return Err(VaultError::ProposalNotPending);
+        }
+
         let role = storage::get_role(&env, &caller);
         if role != Role::Admin && caller != proposal.proposer {
             return Err(VaultError::Unauthorized);
         }
 
-        // IPFS CID v0 is 46 chars; CIDv1 base32 is 59+ chars; reject anything
-        // outside the valid range with a dedicated error code.
         let alen = attachment.len();
         if !(MIN_ATTACHMENT_LEN..=MAX_ATTACHMENT_LEN).contains(&alen) {
-            return Err(VaultError::InvalidAmount);
+            return Err(VaultError::AttachmentHashInvalid);
+        }
+
+        // Validate CID prefix: CIDv0 starts with "Qm", CIDv1 base32 starts with "bafy".
+        // Copy the first 4 bytes into a stack buffer for prefix comparison.
+        let mut prefix = [0u8; 4];
+        {
+            // copy_into_slice requires exact length — copy full string into a
+            // MAX_ATTACHMENT_LEN-sized buffer and read the first 4 bytes.
+            let mut buf = [0u8; MAX_ATTACHMENT_LEN as usize];
+            let buf_slice = &mut buf[..alen as usize];
+            attachment.copy_into_slice(buf_slice);
+            prefix.copy_from_slice(&buf_slice[..4]);
+        }
+        // "Qm" = [0x51, 0x6d], "bafy" = [0x62, 0x61, 0x66, 0x79]
+        let is_cidv0 = prefix[0] == b'Q' && prefix[1] == b'm';
+        let is_cidv1 = prefix == *b"bafy";
+        if !is_cidv0 && !is_cidv1 {
+            return Err(VaultError::AttachmentHashInvalid);
         }
 
         let mut attachments = storage::get_attachments(&env, proposal_id);
         if attachments.len() >= MAX_ATTACHMENTS {
             return Err(VaultError::TooManyAttachments);
         }
+        // O(n) duplicate check over MAX_ATTACHMENTS = 10 entries.
         if attachments.contains(attachment.clone()) {
-            return Err(VaultError::InvalidAmount);
+            return Err(VaultError::AttachmentAlreadyExists);
         }
         attachments.push_back(attachment);
         storage::set_attachments(&env, proposal_id, &attachments);
@@ -4333,16 +4356,22 @@ impl VaultDAO {
         Ok(())
     }
 
-    /// Remove an attachment by index.
+    /// Remove an attachment by CID value from a pending proposal.
+    ///
+    /// Only the original proposer or an Admin may remove attachments.
     pub fn remove_attachment(
         env: Env,
         caller: Address,
         proposal_id: u64,
-        index: u32,
+        cid: String,
     ) -> Result<(), VaultError> {
         caller.require_auth();
 
         let proposal = storage::get_proposal(&env, proposal_id)?;
+
+        if proposal.status != ProposalStatus::Pending {
+            return Err(VaultError::ProposalNotPending);
+        }
 
         let role = storage::get_role(&env, &caller);
         if role != Role::Admin && caller != proposal.proposer {
@@ -4350,10 +4379,15 @@ impl VaultDAO {
         }
 
         let mut attachments = storage::get_attachments(&env, proposal_id);
-        if index >= attachments.len() {
-            return Err(VaultError::ProposalNotFound); // reuse as "index out of range"
+        let mut found: Option<u32> = None;
+        for i in 0..attachments.len() {
+            if attachments.get(i).unwrap() == cid {
+                found = Some(i);
+                break;
+            }
         }
-        attachments.remove(index);
+        let idx = found.ok_or(VaultError::ProposalNotFound)?;
+        attachments.remove(idx);
         storage::set_attachments(&env, proposal_id, &attachments);
         storage::extend_instance_ttl(&env);
 
