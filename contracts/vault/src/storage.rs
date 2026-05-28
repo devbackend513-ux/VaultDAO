@@ -227,6 +227,8 @@ pub enum FeatureKey {
     MetricsBucket(u64),
     /// Ordered list of stored bucket week numbers (for pruning) -> Vec<u64>
     MetricsBucketIndex,
+    /// Number of times a proposal's voting deadline has been extended -> u32
+    DeadlineExtensionCount(u64),
 }
 
 /// TTL constants (in ledgers, ~5 seconds each)
@@ -2249,4 +2251,29 @@ pub fn get_metrics_for_period(env: &Env, from_week: u64, to_week: u64) -> VaultM
         }
     }
     agg
+}
+
+// ============================================================================
+// Voting Deadline Extension Count
+// ============================================================================
+
+/// Get the number of times a proposal's voting deadline has been extended.
+/// Stored in temporary storage so it auto-expires with the proposal.
+pub fn get_deadline_extension_count(env: &Env, proposal_id: u64) -> u32 {
+    env.storage()
+        .temporary()
+        .get(&FeatureKey::DeadlineExtensionCount(proposal_id))
+        .unwrap_or(0)
+}
+
+/// Increment and persist the deadline extension count for a proposal.
+/// Returns the new count after incrementing.
+pub fn increment_deadline_extension_count(env: &Env, proposal_id: u64) -> u32 {
+    let count = get_deadline_extension_count(env, proposal_id) + 1;
+    let key = FeatureKey::DeadlineExtensionCount(proposal_id);
+    env.storage().temporary().set(&key, &count);
+    env.storage()
+        .temporary()
+        .extend_ttl(&key, PROPOSAL_TTL / 2, PROPOSAL_TTL);
+    count
 }
