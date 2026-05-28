@@ -32,10 +32,10 @@ use types::{
     Milestone, NotificationPreferences, OptionalVaultOracleConfig, Priority, Proposal,
     ProposalAmendment, ProposalStatus, ProposalTemplate, RecoveryConfig, RecoveryProposal,
     RecoveryStatus, RecurringPayment, Reputation, ReputationConfig, RetryConfig, RetryState, Role,
-    RoleAssignment, StakingConfig, StreamStatus, StreamingPayment, Subscription,
-    SubscriptionStatus, SubscriptionTier, SwapProposal, SwapResult, TemplateOverrides,
-    ThresholdStrategy, TransferDetails, VaultAction, VaultMetrics, VaultOracleConfig,
-    VaultPriceData, VelocityConfig, VotingStrategy,
+    RoleAssignment, ScheduledTransferConfig, StakingConfig, StreamStatus, StreamingPayment,
+    Subscription, SubscriptionStatus, SubscriptionTier, SwapProposal, SwapResult,
+    TemplateOverrides, ThresholdStrategy, TransferDetails, VaultAction, VaultMetrics,
+    VaultOracleConfig, VaultPriceData, VelocityConfig, VotingStrategy,
 };
 
 /// The main contract structure for VaultDAO.
@@ -297,6 +297,7 @@ impl VaultDAO {
             insurance_amount,
             empty_dependencies,
             None,
+            0,
         )
     }
 
@@ -312,7 +313,7 @@ impl VaultDAO {
     /// * `conditions` - Optional execution conditions.
     /// * `condition_logic` - And/Or logic for combining conditions.
     /// * `insurance_amount` - Tokens staked by proposer as guarantee (0 = none).
-    /// * `execution_time` - Scheduled execution ledger.
+    /// * `schedule` - Scheduled execution time and optional window (0 window = no upper bound).
     ///
     /// # Returns
     /// The unique ID of the newly created proposal.
@@ -328,7 +329,7 @@ impl VaultDAO {
         conditions: Vec<Condition>,
         condition_logic: ConditionLogic,
         insurance_amount: i128,
-        execution_time: u64,
+        schedule: ScheduledTransferConfig,
     ) -> Result<u64, VaultError> {
         let empty_dependencies = Vec::new(&env);
         Self::propose_transfer_internal(
@@ -343,7 +344,8 @@ impl VaultDAO {
             condition_logic,
             insurance_amount,
             empty_dependencies,
-            Some(execution_time),
+            Some(schedule.execution_time),
+            schedule.execution_window_ledgers,
         )
     }
 
@@ -378,6 +380,7 @@ impl VaultDAO {
             insurance_amount,
             depends_on,
             None,
+            0,
         )
     }
 
@@ -395,6 +398,7 @@ impl VaultDAO {
         insurance_amount: i128,
         depends_on: Vec<u64>,
         execution_time: Option<u64>,
+        execution_window_ledgers: u64,
     ) -> Result<u64, VaultError> {
         // 1. Verify identity
         proposer.require_auth();
@@ -584,6 +588,7 @@ impl VaultDAO {
             expires_at: current_ledger + PROPOSAL_EXPIRY_LEDGERS,
             unlock_ledger,
             execution_time,
+            execution_window_ledgers,
             insurance_amount: actual_insurance,
             stake_amount: actual_stake,
             gas_limit: proposal_gas_limit,
@@ -812,6 +817,7 @@ impl VaultDAO {
                     0
                 },
                 execution_time: None,
+                execution_window_ledgers: 0,
                 insurance_amount: insurance_per_proposal,
                 stake_amount: 0, // Batch proposals don't require individual stakes
                 gas_limit: proposal_gas_limit,
@@ -2762,6 +2768,7 @@ impl VaultDAO {
             expires_at: current_ledger + PROPOSAL_EXPIRY_LEDGERS,
             unlock_ledger: 0,
             execution_time: None,
+                execution_window_ledgers: 0,
             insurance_amount: 0,
             stake_amount: 0,
             gas_limit: 0,
@@ -5769,6 +5776,7 @@ impl VaultDAO {
             expires_at: calculate_expiration_ledger(&config, &priority, current_ledger),
             unlock_ledger: 0,
             execution_time: None,
+                execution_window_ledgers: 0,
             insurance_amount,
             stake_amount: 0,
             gas_limit: 0,
@@ -6979,6 +6987,7 @@ impl VaultDAO {
             expires_at,
             unlock_ledger,
             execution_time: None,
+                execution_window_ledgers: 0,
             insurance_amount: 0,
             stake_amount: 0, // Template proposals don't require stake
             gas_limit: 0,
@@ -8243,6 +8252,17 @@ impl VaultDAO {
             return Err(VaultError::TimelockNotExpired);
         }
 
+        // Check execution window upper bound
+        if proposal.execution_window_ledgers > 0
+            && current_ledger > execution_time + proposal.execution_window_ledgers
+        {
+            proposal.status = ProposalStatus::Expired;
+            storage::tag_index_prune_proposal(&env, &proposal.tags, proposal_id);
+            storage::set_proposal(&env, &proposal);
+            events::emit_proposal_expired(&env, proposal_id, proposal.expires_at);
+            return Err(VaultError::ExecutionWindowExpired);
+        }
+
         // Verify sufficient approvals
         let config = storage::get_config(&env)?;
         if proposal.approvals.len() < config.threshold {
@@ -8439,6 +8459,36 @@ impl VaultDAO {
 
         sorted
     }
+
+    /// Expire a scheduled proposal whose execution window has passed.
+    ///
+    /// Anyone can call this to transition a window-expired scheduled proposal to
+    /// `ProposalStatus::Expired`. No-ops if the proposal is not scheduled or the
+    /// window has not yet passed.
+    pub fn expire_proposal(env: Env, proposal_id: u64) -> Result<(), VaultError> {
+        let mut proposal = storage::get_proposal(&env, proposal_id)?;
+
+        if proposal.status != ProposalStatus::Scheduled {
+            return Err(VaultError::ProposalNotPending);
+        }
+
+        let execution_time = proposal.execution_time.ok_or(VaultError::ProposalNotPending)?;
+        let current_ledger = env.ledger().sequence() as u64;
+
+        if proposal.execution_window_ledgers == 0
+            || current_ledger <= execution_time + proposal.execution_window_ledgers
+        {
+            return Err(VaultError::TimelockNotExpired);
+        }
+
+        proposal.status = ProposalStatus::Expired;
+        storage::tag_index_prune_proposal(&env, &proposal.tags, proposal_id);
+        storage::set_proposal(&env, &proposal);
+        events::emit_proposal_expired(&env, proposal_id, proposal.expires_at);
+
+        Ok(())
+    }
+
     // ============================================================================
     // Funding Rounds
     // ============================================================================
@@ -8846,6 +8896,7 @@ impl VaultDAO {
             expires_at: current_ledger + PROPOSAL_EXPIRY_LEDGERS,
             unlock_ledger,
             execution_time: None,
+                execution_window_ledgers: 0,
             insurance_amount,
             stake_amount: 0,
             gas_limit: 0,
@@ -9494,6 +9545,7 @@ impl VaultDAO {
             expires_at: current_ledger + PROPOSAL_EXPIRY_LEDGERS,
             unlock_ledger,
             execution_time: None,
+                execution_window_ledgers: 0,
             insurance_amount,
             stake_amount: 0,
             gas_limit: 0,
@@ -9751,6 +9803,7 @@ impl VaultDAO {
             expires_at: current_ledger + (config.timelock_delay * 10), // Longer expiry for upgrades
             unlock_ledger: current_ledger + config.timelock_delay, // Mandatory timelock
             execution_time: None,
+                execution_window_ledgers: 0,
             insurance_amount: 0,
             stake_amount: 0,
             gas_limit: 0,
@@ -9960,6 +10013,7 @@ impl VaultDAO {
                 0
             },
             execution_time: None,
+            execution_window_ledgers: 0,
             insurance_amount: 0, // Insurance not cloned
             stake_amount: 0, // Stake not cloned
             gas_limit: source_proposal.gas_limit,

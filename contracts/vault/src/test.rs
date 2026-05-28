@@ -11119,3 +11119,273 @@ mod template_version_tests {
         assert_eq!(v2.amount, 200);
     }
 }
+
+// ============================================================================
+// Scheduled Proposal Execution Window Tests
+// ============================================================================
+
+#[cfg(test)]
+mod scheduled_window_tests {
+    use super::*;
+    use crate::types::{
+        ConditionLogic, Priority, RetryConfig, ScheduledTransferConfig, ThresholdStrategy,
+        VelocityConfig,
+    };
+    use crate::{InitConfig, VaultDAO, VaultDAOClient};
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        token::StellarAssetClient,
+        Address, Env, Symbol, Vec,
+    };
+
+    fn setup(env: &Env) -> (VaultDAOClient<'_>, Address, Address, Address) {
+        let contract_id = env.register(VaultDAO, ());
+        let client = VaultDAOClient::new(env, &contract_id);
+        let admin = Address::generate(env);
+        let token_admin = Address::generate(env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin.clone())
+            .address();
+
+        let mut signers = Vec::new(env);
+        signers.push_back(admin.clone());
+
+        client.initialize(
+            &admin,
+            &InitConfig {
+                signers,
+                threshold: 1,
+                quorum: 0,
+                quorum_percentage: 0,
+                default_voting_deadline: 0,
+                spending_limit: 1_000_000,
+                daily_limit: 5_000_000,
+                weekly_limit: 10_000_000,
+                timelock_threshold: 999_999_999,
+                timelock_delay: 0,
+                velocity_limit: VelocityConfig { limit: 100, window: 3600 },
+                threshold_strategy: ThresholdStrategy::Fixed,
+                pre_execution_hooks: Vec::new(env),
+                post_execution_hooks: Vec::new(env),
+                veto_addresses: Vec::new(env),
+                veto_window_ledgers: 0,
+                retry_config: RetryConfig {
+                    enabled: false,
+                    max_retries: 0,
+                    initial_backoff_ledgers: 0,
+                },
+                recovery_config: crate::types::RecoveryConfig::default(env),
+                staking_config: crate::types::StakingConfig::default(),
+            },
+        );
+
+        (client, admin, token, contract_id)
+    }
+
+    /// Propose a scheduled transfer, approve it (→ Scheduled), and return the proposal_id.
+    fn propose_and_approve_scheduled(
+        env: &Env,
+        client: &VaultDAOClient<'_>,
+        admin: &Address,
+        token: &Address,
+        vault: &Address,
+        execution_time: u64,
+        execution_window_ledgers: u64,
+    ) -> u64 {
+        StellarAssetClient::new(env, token).mint(vault, &1_000_000);
+        let recipient = Address::generate(env);
+        let proposal_id = client
+            .propose_scheduled_transfer(
+                admin,
+                &recipient,
+                token,
+                &100i128,
+                &Symbol::new(env, "memo"),
+                &Priority::Normal,
+                &Vec::new(env),
+                &ConditionLogic::And,
+                &0i128,
+                &ScheduledTransferConfig {
+                    execution_time,
+                    execution_window_ledgers,
+                },
+            );
+        // Approve → status becomes Scheduled
+        client.approve_proposal(admin, &proposal_id);
+        proposal_id
+    }
+
+    // -----------------------------------------------------------------------
+    // Execute within window
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_execute_within_window() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, token, vault) = setup(&env);
+
+        let current = env.ledger().sequence() as u64;
+        let exec_time = current + 10;
+        let window = 100;
+
+        let pid = propose_and_approve_scheduled(
+            &env, &client, &admin, &token, &vault, exec_time, window,
+        );
+
+        // Advance to exactly execution_time
+        env.ledger().set_sequence_number(exec_time as u32);
+
+        client.execute_scheduled_proposal(&admin, &pid);
+
+        let proposal = client.get_proposal(&pid);
+        assert_eq!(proposal.status, ProposalStatus::Executed);
+    }
+
+    // -----------------------------------------------------------------------
+    // Execute after window → ExecutionWindowExpired
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_execute_after_window_returns_error() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, token, vault) = setup(&env);
+
+        let current = env.ledger().sequence() as u64;
+        let exec_time = current + 10;
+        let window = 50;
+
+        let pid = propose_and_approve_scheduled(
+            &env, &client, &admin, &token, &vault, exec_time, window,
+        );
+
+        // Advance past execution_time + window
+        env.ledger().set_sequence_number((exec_time + window + 1) as u32);
+
+        let result = client.try_execute_scheduled_proposal(&admin, &pid);
+        assert_eq!(result, Err(Ok(VaultError::ExecutionWindowExpired)));
+
+        // Proposal must now be Expired
+        let proposal = client.get_proposal(&pid);
+        assert_eq!(proposal.status, ProposalStatus::Expired);
+    }
+
+    // -----------------------------------------------------------------------
+    // window = 0 → no upper bound, executes arbitrarily late
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_window_zero_no_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, token, vault) = setup(&env);
+
+        let current = env.ledger().sequence() as u64;
+        let exec_time = current + 10;
+
+        let pid = propose_and_approve_scheduled(
+            &env, &client, &admin, &token, &vault, exec_time, 0, // window = 0
+        );
+
+        // Advance far past execution_time
+        env.ledger().set_sequence_number((exec_time + 100_000) as u32);
+
+        // Should succeed — no window enforced
+        client.execute_scheduled_proposal(&admin, &pid);
+
+        let proposal = client.get_proposal(&pid);
+        assert_eq!(proposal.status, ProposalStatus::Executed);
+    }
+
+    // -----------------------------------------------------------------------
+    // Execute before execution_time → TimelockNotExpired
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_execute_before_execution_time() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, token, vault) = setup(&env);
+
+        let current = env.ledger().sequence() as u64;
+        let exec_time = current + 100;
+
+        let pid = propose_and_approve_scheduled(
+            &env, &client, &admin, &token, &vault, exec_time, 50,
+        );
+
+        // Still before execution_time
+        let result = client.try_execute_scheduled_proposal(&admin, &pid);
+        assert_eq!(result, Err(Ok(VaultError::TimelockNotExpired)));
+    }
+
+    // -----------------------------------------------------------------------
+    // expire_proposal transitions window-expired proposal to Expired
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_expire_proposal_after_window() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, token, vault) = setup(&env);
+
+        let current = env.ledger().sequence() as u64;
+        let exec_time = current + 10;
+        let window = 20;
+
+        let pid = propose_and_approve_scheduled(
+            &env, &client, &admin, &token, &vault, exec_time, window,
+        );
+
+        // Advance past window
+        env.ledger().set_sequence_number((exec_time + window + 1) as u32);
+
+        client.expire_proposal(&pid);
+
+        let proposal = client.get_proposal(&pid);
+        assert_eq!(proposal.status, ProposalStatus::Expired);
+    }
+
+    // -----------------------------------------------------------------------
+    // expire_proposal before window passes → TimelockNotExpired
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_expire_proposal_before_window() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, token, vault) = setup(&env);
+
+        let current = env.ledger().sequence() as u64;
+        let exec_time = current + 10;
+        let window = 100;
+
+        let pid = propose_and_approve_scheduled(
+            &env, &client, &admin, &token, &vault, exec_time, window,
+        );
+
+        // Advance to just inside the window
+        env.ledger().set_sequence_number((exec_time + window) as u32);
+
+        let result = client.try_expire_proposal(&pid);
+        assert_eq!(result, Err(Ok(VaultError::TimelockNotExpired)));
+    }
+
+    // -----------------------------------------------------------------------
+    // expire_proposal with window = 0 → TimelockNotExpired (no window to expire)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_expire_proposal_window_zero_noop() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, token, vault) = setup(&env);
+
+        let current = env.ledger().sequence() as u64;
+        let exec_time = current + 10;
+
+        let pid = propose_and_approve_scheduled(
+            &env, &client, &admin, &token, &vault, exec_time, 0,
+        );
+
+        env.ledger().set_sequence_number((exec_time + 999_999) as u32);
+
+        // window = 0 means no expiry — expire_proposal should refuse
+        let result = client.try_expire_proposal(&pid);
+        assert_eq!(result, Err(Ok(VaultError::TimelockNotExpired)));
+    }
+}

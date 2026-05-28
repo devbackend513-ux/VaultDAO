@@ -98,6 +98,8 @@ pub enum VaultError {
     TooManyTags = 831,
     /// Metadata value is empty or exceeds the allowed length
     MetadataValueInvalid = 832,
+    /// Scheduled proposal execution window has expired
+    ExecutionWindowExpired = 870,
 }
 
 // Additional error types that exceed contracterror limits - use generic errors above
