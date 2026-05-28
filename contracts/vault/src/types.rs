@@ -19,6 +19,9 @@
 
 use soroban_sdk::{contracttype, Address, Env, Map, String, Symbol, Vec};
 
+mod types_balance_snapshot;
+use types_balance_snapshot::BalanceSnapshot;
+
 /// Oracle configuration for price feeds
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
