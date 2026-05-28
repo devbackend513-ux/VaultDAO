@@ -182,7 +182,7 @@ export async function createApp(env: BackendEnv, runtime: BackendRuntime) {
     createTransactionsRouter(runtime.transactionsService, env.contractId),
   );
 
-  v1Router.use("/audit", authMiddleware, createAuditRouter(env.sorobanRpcUrl));
+  v1Router.use("/audit", authMiddleware, createAuditRouter(env.sorobanRpcUrl, adminAuthMiddleware));
 
   if (runtime.notificationQueue) {
     v1Router.use(
