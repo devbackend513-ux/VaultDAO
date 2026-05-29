@@ -41,6 +41,8 @@ pub enum VaultError {
     ProposalAlreadyCancelled = 25,
     /// Signer has already approved this proposal
     AlreadyApproved = 30,
+    /// Signer has already abstained on this proposal
+    AlreadyAbstained = 910,
     /// Amount is invalid (zero, negative, or exceeds limits)
     InvalidAmount = 40,
     /// Amount exceeds the single-proposal spending limit

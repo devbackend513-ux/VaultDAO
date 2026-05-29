@@ -1,7 +1,7 @@
 use super::*;
 use crate::types::{
     DexConfig, FeeStructure, Reputation, RetryConfig, SwapProposal, TimeBasedThreshold,
-    TransferDetails, VelocityConfig,
+    TransferDetails, VelocityConfig, VoteChoice,
 };
 use crate::{InitConfig, VaultDAO, VaultDAOClient};
 use soroban_sdk::{
@@ -1448,7 +1448,173 @@ fn test_cannot_abstain_twice() {
     client.abstain_proposal(&signer1, &proposal_id);
 
     let res = client.try_abstain_proposal(&signer1, &proposal_id);
-    assert_eq!(res.err(), Some(Ok(VaultError::AlreadyApproved)));
+    assert_eq!(res.err(), Some(Ok(VaultError::AlreadyAbstained)));
+}
+
+#[test]
+fn test_cannot_approve_after_abstaining() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(VaultDAO, ());
+    let client = VaultDAOClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let signer1 = Address::generate(&env);
+    let user = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+    token_client.mint(&contract_id, &1000);
+
+    let mut signers = Vec::new(&env);
+    signers.push_back(admin.clone());
+    signers.push_back(signer1.clone());
+
+    let config = InitConfig {
+        signers,
+        threshold: 2,
+        quorum: 0,
+        quorum_percentage: 0,
+        default_voting_deadline: 0,
+        spending_limit: 1000,
+        daily_limit: 5000,
+        weekly_limit: 10000,
+        timelock_threshold: 500,
+        timelock_delay: 100,
+        velocity_limit: VelocityConfig {
+            limit: 100,
+            window: 3600, per_token_limit: 0 },
+        threshold_strategy: ThresholdStrategy::Fixed,
+        veto_addresses: Vec::new(&env),
+        retry_config: RetryConfig {
+            enabled: false,
+            max_retries: 0,
+            initial_backoff_ledgers: 0,
+        },
+        recovery_config: crate::types::RecoveryConfig::default(&env),
+        staking_config: types::StakingConfig::default(),
+        proposal_id_prefix: 0,
+        pre_execution_hooks: soroban_sdk::Vec::new(&env),
+        post_execution_hooks: soroban_sdk::Vec::new(&env),
+    };
+    client.initialize(&admin, &config);
+    client.set_role(&admin, &signer1, &Role::Treasurer);
+
+    let proposal_id = client.propose_transfer(
+        &signer1,
+        &user,
+        &token,
+        &100,
+        &Symbol::new(&env, "test"),
+        &Priority::Normal,
+        &Vec::new(&env),
+        &ConditionLogic::And,
+        &0i128,
+    );
+
+    client.abstain_proposal(&signer1, &proposal_id);
+
+    let res = client.try_approve_proposal(&signer1, &proposal_id);
+    assert_eq!(res.err(), Some(Ok(VaultError::AlreadyAbstained)));
+}
+
+#[test]
+fn test_change_vote_approval_to_abstain() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_sequence_number(100);
+
+    let contract_id = env.register(VaultDAO, ());
+    let client = VaultDAOClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let signer1 = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+    token_client.mint(&contract_id, &1000);
+
+    let mut signers = Vec::new(&env);
+    signers.push_back(admin.clone());
+    signers.push_back(signer1.clone());
+
+    let mut config = default_init_config(&env, signers, 1);
+    config.default_voting_deadline = 10;
+    client.initialize(&admin, &config);
+    client.set_role(&admin, &signer1, &Role::Treasurer);
+
+    let proposal_id = client.propose_transfer(
+        &signer1,
+        &recipient,
+        &token,
+        &100,
+        &Symbol::new(&env, "changev"),
+        &Priority::Normal,
+        &Vec::new(&env),
+        &ConditionLogic::And,
+        &0i128,
+    );
+
+    client.approve_proposal(&signer1, &proposal_id);
+    assert_eq!(client.get_proposal(&proposal_id).status, ProposalStatus::Approved);
+
+    client.change_vote(&signer1, &proposal_id, &VoteChoice::Abstain);
+
+    let proposal = client.get_proposal(&proposal_id);
+    assert_eq!(proposal.status, ProposalStatus::Pending);
+    assert_eq!(proposal.approvals.len(), 0);
+    assert_eq!(proposal.abstentions.len(), 1);
+    assert!(proposal.abstentions.contains(&signer1));
+}
+
+#[test]
+fn test_change_vote_after_deadline_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_sequence_number(100);
+
+    let contract_id = env.register(VaultDAO, ());
+    let client = VaultDAOClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let signer1 = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+    token_client.mint(&contract_id, &1000);
+
+    let mut signers = Vec::new(&env);
+    signers.push_back(admin.clone());
+    signers.push_back(signer1.clone());
+
+    let mut config = default_init_config(&env, signers, 1);
+    config.default_voting_deadline = 10;
+    client.initialize(&admin, &config);
+    client.set_role(&admin, &signer1, &Role::Treasurer);
+
+    let proposal_id = client.propose_transfer(
+        &signer1,
+        &recipient,
+        &token,
+        &100,
+        &Symbol::new(&env, "latechg"),
+        &Priority::Normal,
+        &Vec::new(&env),
+        &ConditionLogic::And,
+        &0i128,
+    );
+
+    client.approve_proposal(&signer1, &proposal_id);
+    env.ledger().set_sequence_number(111);
+
+    let res = client.try_change_vote(&signer1, &proposal_id, &VoteChoice::Abstain);
+    assert_eq!(res.err(), Some(Ok(VaultError::ProposalExpired)));
 }
 
 #[test]

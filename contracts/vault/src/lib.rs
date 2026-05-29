@@ -36,6 +36,7 @@ use types::{
     Subscription, SubscriptionStatus, SubscriptionTier, SwapProposal, SwapResult,
     TemplateOverrides, ThresholdStrategy, TransferDetails, VaultAction, VaultMetrics,
     VaultOracleConfig, VaultPriceData, VelocityConfig, VotingStrategy,
+    VoteChoice,
 };
 
 /// The main contract structure for VaultDAO.
@@ -985,8 +986,12 @@ impl VaultDAO {
                 continue;
             }
 
-            // Prevent double-approval or abstaining then approving
-            if proposal.approvals.contains(&voter) || proposal.abstentions.contains(&voter) {
+            if proposal.abstentions.contains(&voter) {
+                return Err(VaultError::AlreadyAbstained);
+            }
+
+            // Prevent double-approval
+            if proposal.approvals.contains(&voter) {
                 continue;
             }
 
@@ -1042,39 +1047,19 @@ impl VaultDAO {
             return Ok(());
         }
 
-        // Calculate current vote totals after all representations are recorded
-        let approval_count = proposal.approvals.len();
-        let quorum_votes = approval_count + proposal.abstentions.len();
-        let previous_quorum_votes = quorum_votes.saturating_sub(vote_cast_count);
-        let required_quorum = Self::effective_quorum(&config);
-        let was_quorum_reached = required_quorum == 0 || previous_quorum_votes >= required_quorum;
-
-        // Check if threshold met AND quorum satisfied
-        let threshold_reached = Self::is_threshold_reached(&env, &config, &proposal);
-        let quorum_reached = required_quorum == 0 || quorum_votes >= required_quorum;
-        if required_quorum > 0 && !was_quorum_reached && quorum_reached {
-            events::emit_quorum_reached(&env, proposal_id, quorum_votes, required_quorum);
-        }
-
-        if threshold_reached && quorum_reached {
-            if proposal.execution_time.is_some() {
-                proposal.status = ProposalStatus::Scheduled;
-                events::emit_proposal_scheduled(
-                    &env,
-                    proposal_id,
-                    proposal.execution_time.unwrap(),
-                    current_ledger,
-                );
-            } else {
-                proposal.status = ProposalStatus::Approved;
-                if proposal.amount >= config.timelock_threshold {
-                    proposal.unlock_ledger = current_ledger + config.timelock_delay;
-                } else {
-                    proposal.unlock_ledger = 0;
-                }
-                events::emit_proposal_ready(&env, proposal_id, proposal.unlock_ledger);
-            }
-        }
+        let previous_quorum_votes = proposal
+            .approvals
+            .len()
+            .saturating_add(proposal.abstentions.len())
+            .saturating_sub(vote_cast_count);
+        Self::reevaluate_vote_state(
+            &env,
+            &config,
+            proposal_id,
+            &mut proposal,
+            current_ledger,
+            previous_quorum_votes,
+        );
 
         storage::set_proposal(&env, &proposal);
         storage::extend_instance_ttl(&env);
@@ -1084,7 +1069,7 @@ impl VaultDAO {
             &env,
             proposal_id,
             &signer,
-            approval_count,
+            proposal.approvals.len(),
             config.threshold,
         );
 
@@ -1136,8 +1121,12 @@ impl VaultDAO {
                 continue;
             }
 
-            // Prevent double-abstaining or approving then abstaining
-            if proposal.approvals.contains(&voter) || proposal.abstentions.contains(&voter) {
+            if proposal.approvals.contains(&voter) {
+                return Err(VaultError::AlreadyApproved);
+            }
+
+            // Prevent double-abstaining
+            if proposal.abstentions.contains(&voter) {
                 continue;
             }
 
@@ -1155,7 +1144,7 @@ impl VaultDAO {
         }
 
         if vote_cast_count == 0 {
-            return Err(VaultError::AlreadyApproved);
+            return Err(VaultError::AlreadyAbstained);
         }
 
         // Check expiration
@@ -1190,40 +1179,19 @@ impl VaultDAO {
             return Ok(());
         }
 
-        // Calculate current vote totals
-        let approval_count = proposal.approvals.len();
-        let abstention_count = proposal.abstentions.len();
-        let quorum_votes = approval_count + abstention_count;
-        let previous_quorum_votes = quorum_votes.saturating_sub(vote_cast_count);
-        let required_quorum = Self::effective_quorum(&config);
-        let was_quorum_reached = required_quorum == 0 || previous_quorum_votes >= required_quorum;
-
-        // Check if threshold met AND quorum satisfied
-        let threshold_reached = Self::is_threshold_reached(&env, &config, &proposal);
-        let quorum_reached = required_quorum == 0 || quorum_votes >= required_quorum;
-        if required_quorum > 0 && !was_quorum_reached && quorum_reached {
-            events::emit_quorum_reached(&env, proposal_id, quorum_votes, required_quorum);
-        }
-
-        if threshold_reached && quorum_reached {
-            if proposal.execution_time.is_some() {
-                proposal.status = ProposalStatus::Scheduled;
-                events::emit_proposal_scheduled(
-                    &env,
-                    proposal_id,
-                    proposal.execution_time.unwrap(),
-                    current_ledger,
-                );
-            } else {
-                proposal.status = ProposalStatus::Approved;
-                if proposal.amount >= config.timelock_threshold {
-                    proposal.unlock_ledger = current_ledger + config.timelock_delay;
-                } else {
-                    proposal.unlock_ledger = 0;
-                }
-                events::emit_proposal_ready(&env, proposal_id, proposal.unlock_ledger);
-            }
-        }
+        let previous_quorum_votes = proposal
+            .approvals
+            .len()
+            .saturating_add(proposal.abstentions.len())
+            .saturating_sub(vote_cast_count);
+        Self::reevaluate_vote_state(
+            &env,
+            &config,
+            proposal_id,
+            &mut proposal,
+            current_ledger,
+            previous_quorum_votes,
+        );
 
         storage::set_proposal(&env, &proposal);
         storage::extend_instance_ttl(&env);
@@ -1233,9 +1201,148 @@ impl VaultDAO {
             &env,
             proposal_id,
             &signer,
-            abstention_count as u32,
-            quorum_votes as u32,
+            proposal.abstentions.len(),
+            proposal.approvals.len() + proposal.abstentions.len(),
         );
+
+        Ok(())
+    }
+
+    /// Change an existing vote during the active voting window.
+    pub fn change_vote(
+        env: Env,
+        signer: Address,
+        proposal_id: u64,
+        new_vote: VoteChoice,
+    ) -> Result<(), VaultError> {
+        signer.require_auth();
+
+        let config = storage::get_config(&env)?;
+        if !config.signers.contains(&signer) {
+            return Err(VaultError::NotASigner);
+        }
+
+        let mut proposal = storage::get_proposal(&env, proposal_id)?;
+        if !proposal.snapshot_signers.contains(&signer) {
+            return Err(VaultError::VoterNotInSnapshot);
+        }
+
+        if proposal.status != ProposalStatus::Pending
+            && proposal.status != ProposalStatus::Approved
+            && proposal.status != ProposalStatus::Scheduled
+        {
+            return Err(VaultError::ProposalNotPending);
+        }
+
+        let current_ledger = env.ledger().sequence() as u64;
+        if proposal.expires_at > 0 && current_ledger > proposal.expires_at {
+            return Err(VaultError::ProposalExpired);
+        }
+        if proposal.voting_deadline == 0 || current_ledger > proposal.voting_deadline {
+            return Err(VaultError::ProposalExpired);
+        }
+
+        let previous_quorum_votes = proposal.approvals.len() + proposal.abstentions.len();
+        let mut represented_voters = Vec::new(&env);
+        represented_voters.push_back(signer.clone());
+        Self::get_all_represented_voters(&env, &signer, &mut represented_voters, 0);
+
+        let mut switched_count: u32 = 0;
+        let mut has_target_vote = false;
+
+        for voter in represented_voters.iter() {
+            if !proposal.snapshot_signers.contains(&voter) {
+                continue;
+            }
+
+            match new_vote {
+                VoteChoice::Approve => {
+                    if proposal.approvals.contains(&voter) {
+                        has_target_vote = true;
+                        continue;
+                    }
+                    if proposal.abstentions.contains(&voter) {
+                        proposal.abstentions =
+                            Self::remove_address_from_vec(&env, &proposal.abstentions, &voter);
+                        proposal.approvals.push_back(voter.clone());
+                        switched_count += 1;
+                        events::emit_vote_changed(
+                            &env,
+                            proposal_id,
+                            &voter,
+                            VoteChoice::Abstain as u32,
+                            VoteChoice::Approve as u32,
+                        );
+                        if voter != signer {
+                            events::emit_delegated_vote(&env, proposal_id, &voter, &signer);
+                        }
+                    }
+                }
+                VoteChoice::Abstain => {
+                    if proposal.abstentions.contains(&voter) {
+                        has_target_vote = true;
+                        continue;
+                    }
+                    if proposal.approvals.contains(&voter) {
+                        proposal.approvals =
+                            Self::remove_address_from_vec(&env, &proposal.approvals, &voter);
+                        proposal.abstentions.push_back(voter.clone());
+                        switched_count += 1;
+                        events::emit_vote_changed(
+                            &env,
+                            proposal_id,
+                            &voter,
+                            VoteChoice::Approve as u32,
+                            VoteChoice::Abstain as u32,
+                        );
+                        if voter != signer {
+                            events::emit_delegated_vote(&env, proposal_id, &voter, &signer);
+                        }
+                    }
+                }
+            }
+        }
+
+        if switched_count == 0 {
+            return Err(match new_vote {
+                VoteChoice::Approve if has_target_vote => VaultError::AlreadyApproved,
+                VoteChoice::Abstain if has_target_vote => VaultError::AlreadyAbstained,
+                _ => VaultError::InvalidStatusTransition,
+            });
+        }
+
+        if new_vote == VoteChoice::Approve {
+            storage::set_approval_ledger(&env, proposal_id, &signer, current_ledger);
+        }
+
+        Self::reevaluate_vote_state(
+            &env,
+            &config,
+            proposal_id,
+            &mut proposal,
+            current_ledger,
+            previous_quorum_votes,
+        );
+
+        storage::set_proposal(&env, &proposal);
+        storage::extend_instance_ttl(&env);
+
+        match new_vote {
+            VoteChoice::Approve => events::emit_proposal_approved(
+                &env,
+                proposal_id,
+                &signer,
+                proposal.approvals.len(),
+                config.threshold,
+            ),
+            VoteChoice::Abstain => events::emit_proposal_abstained(
+                &env,
+                proposal_id,
+                &signer,
+                proposal.abstentions.len(),
+                proposal.approvals.len() + proposal.abstentions.len(),
+            ),
+        }
 
         Ok(())
     }
@@ -1928,7 +2035,7 @@ impl VaultDAO {
         let delegators = storage::get_delegators_for(env, signer);
 
         for delegator in delegators.iter() {
-            if !represented_voters.contains(&delegator) {
+            if !voters.contains(&delegator) {
                 let delegation = storage::get_delegation(env, &delegator);
         
                 let current_ledger = env.ledger().sequence() as u64;
@@ -6080,6 +6187,60 @@ impl VaultDAO {
             return (n * config.quorum_percentage).div_ceil(100);
         }
         0
+    }
+
+    fn remove_address_from_vec(env: &Env, values: &Vec<Address>, target: &Address) -> Vec<Address> {
+        let mut updated = Vec::new(env);
+        for value in values.iter() {
+            if value != *target {
+                updated.push_back(value);
+            }
+        }
+        updated
+    }
+
+    fn reevaluate_vote_state(
+        env: &Env,
+        config: &Config,
+        proposal_id: u64,
+        proposal: &mut Proposal,
+        current_ledger: u64,
+        previous_quorum_votes: u32,
+    ) {
+        let required_quorum = Self::effective_quorum(config);
+        let approval_count = proposal.approvals.len();
+        let quorum_votes = approval_count + proposal.abstentions.len();
+        let was_quorum_reached = required_quorum == 0 || previous_quorum_votes >= required_quorum;
+        let quorum_reached = required_quorum == 0 || quorum_votes >= required_quorum;
+        let threshold_reached = Self::is_threshold_reached(env, config, proposal);
+        let previous_status = proposal.status.clone();
+
+        if required_quorum > 0 && !was_quorum_reached && quorum_reached {
+            events::emit_quorum_reached(env, proposal_id, quorum_votes, required_quorum);
+        }
+
+        if threshold_reached && quorum_reached {
+            if let Some(execution_time) = proposal.execution_time {
+                proposal.status = ProposalStatus::Scheduled;
+                proposal.unlock_ledger = 0;
+                if previous_status != ProposalStatus::Scheduled {
+                    events::emit_proposal_scheduled(env, proposal_id, execution_time, current_ledger);
+                }
+            } else {
+                proposal.status = ProposalStatus::Approved;
+                proposal.unlock_ledger = if proposal.amount >= config.timelock_threshold {
+                    current_ledger + config.timelock_delay
+                } else {
+                    0
+                };
+                if previous_status != ProposalStatus::Approved {
+                    events::emit_proposal_ready(env, proposal_id, proposal.unlock_ledger);
+                }
+            }
+        } else {
+            proposal.status = ProposalStatus::Pending;
+            proposal.unlock_ledger = 0;
+        }
     }
 
     fn is_threshold_reached(env: &Env, config: &Config, proposal: &Proposal) -> bool {

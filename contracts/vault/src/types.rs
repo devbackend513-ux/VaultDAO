@@ -322,6 +322,14 @@ pub enum ProposalStatus {
     Vetoed = 7,
 }
 
+#[contracttype]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum VoteChoice {
+    Approve = 0,
+    Abstain = 1,
+}
+
 /// Proposal priority level for queue ordering
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
