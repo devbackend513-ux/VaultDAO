@@ -178,74 +178,84 @@ export class EventPollingService {
    * then advances the cursor to `latestLedger`.
    */
   private async poll(): Promise<void> {
-    // ── First-run initialisation ─────────────────────────────────────────────
-    if (this.lastLedgerPolled === 0) {
-      const latestLedger = await this.rpcClient.getLatestLedger();
-      this.logger.info(`initializing polling cursor at ledger ${latestLedger}`);
+    const pollStartedAt = Date.now();
+    try {
+      // ── First-run initialisation ─────────────────────────────────────────────
+      if (this.lastLedgerPolled === 0) {
+        const latestLedger = await this.rpcClient.getLatestLedger();
+        this.logger.info(`initializing polling cursor at ledger ${latestLedger}`);
+        await this.storage.saveCursor({
+          lastLedger: latestLedger,
+          updatedAt: new Date().toISOString(),
+        });
+        this.lastLedgerPolled = latestLedger;
+        return;
+      }
+
+      // ── Paginated event fetch ────────────────────────────────────────────────
+      const startLedger = this.lastLedgerPolled + 1;
+      const allEvents: ContractEvent[] = [];
+      let cursor: string | undefined;
+      let latestLedger = this.lastLedgerPolled;
+
+      do {
+        const result = await this.rpcClient.getEventsPage({
+          startLedger,
+          filters: [
+            {
+              type: "contract",
+              contractIds: [this.env.contractId],
+            },
+          ],
+          pagination: {
+            limit: EVENTS_PAGE_LIMIT,
+            ...(cursor !== undefined ? { cursor } : {}),
+          },
+        });
+
+        latestLedger = result.latestLedger;
+
+        allEvents.push(
+          ...result.events.map((raw) => ({
+            id: raw.id,
+            contractId: raw.contractId,
+            topic: raw.topic,
+            value: raw.value,
+            ledger: raw.ledger,
+            ledgerClosedAt: raw.ledgerClosedAt,
+          })),
+        );
+
+        // Continue paginating when the page was full — there may be more events.
+        cursor =
+          result.events.length === EVENTS_PAGE_LIMIT
+            ? result.events[result.events.length - 1].pagingToken
+            : undefined;
+      } while (cursor !== undefined);
+
+      if (allEvents.length > 0) {
+        await this.handleBatch(allEvents);
+      }
+
+      // Advance cursor to the latest ledger reported by the RPC.
       await this.storage.saveCursor({
         lastLedger: latestLedger,
         updatedAt: new Date().toISOString(),
       });
+      // Update polling lag metric
+      if (this.metrics) {
+        this.metrics.setGauge("vaultdao_polling_lag_ledgers", latestLedger - this.lastLedgerPolled);
+      }
+
       this.lastLedgerPolled = latestLedger;
-      return;
+    } finally {
+      if (this.metrics) {
+        this.metrics.observeHistogram(
+          "vaultdao_rpc_latency_ms",
+          Date.now() - pollStartedAt,
+        );
+      }
     }
-
-    // ── Paginated event fetch ────────────────────────────────────────────────
-    const startLedger = this.lastLedgerPolled + 1;
-    const allEvents: ContractEvent[] = [];
-    let cursor: string | undefined;
-    let latestLedger = this.lastLedgerPolled;
-
-    do {
-      const result = await this.rpcClient.getEventsPage({
-        startLedger,
-        filters: [
-          {
-            type: "contract",
-            contractIds: [this.env.contractId],
-          },
-        ],
-        pagination: {
-          limit: EVENTS_PAGE_LIMIT,
-          ...(cursor !== undefined ? { cursor } : {}),
-        },
-      });
-
-      latestLedger = result.latestLedger;
-
-      allEvents.push(
-        ...result.events.map((raw) => ({
-          id: raw.id,
-          contractId: raw.contractId,
-          topic: raw.topic,
-          value: raw.value,
-          ledger: raw.ledger,
-          ledgerClosedAt: raw.ledgerClosedAt,
-        })),
-      );
-
-      // Continue paginating when the page was full — there may be more events.
-      cursor =
-        result.events.length === EVENTS_PAGE_LIMIT
-          ? result.events[result.events.length - 1].pagingToken
-          : undefined;
-    } while (cursor !== undefined);
-
-    if (allEvents.length > 0) {
-      await this.handleBatch(allEvents);
-    }
-
-    // Advance cursor to the latest ledger reported by the RPC.
-    await this.storage.saveCursor({
-      lastLedger: latestLedger,
-      updatedAt: new Date().toISOString(),
-    });
-    // Update polling lag metric
-    if (this.metrics) {
-      this.metrics.setGauge("vaultdao_polling_lag_ledgers", latestLedger - this.lastLedgerPolled);
-    }
-
-    this.lastLedgerPolled = latestLedger;
   }
 
   /**
@@ -297,6 +307,7 @@ export class EventPollingService {
       // Increment events processed metric
       if (this.metrics) {
         this.metrics.incrementCounter("vaultdao_events_processed_total");
+        this.metrics.incrementCounter("vaultdao_events_polled_total");
       }
 
       await this.processEvent(event);
