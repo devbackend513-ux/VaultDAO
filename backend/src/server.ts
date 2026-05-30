@@ -33,6 +33,7 @@ import { createLogger } from "./shared/logging/logger.js";
 import { SqliteStorageAdapter } from "./shared/storage/index.js";
 import { TransactionsService } from "./modules/transactions/transactions.service.js";
 import type { Server } from "node:http";
+import { CircuitBreaker } from "./shared/http/circuit-breaker.js";
 
 import { LifecycleManager } from "./app/lifecycle/lifecycle-manager.js";
 
@@ -279,6 +280,10 @@ export async function startServer(
       snapshotService,
       undefined, // rpcClient
       metricsRegistry,
+      new CircuitBreaker({
+        failureThreshold: 5,
+        resetTimeoutMs: 30_000,
+      }),
     );
 
     pollers.push(poller);
