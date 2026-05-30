@@ -30,9 +30,11 @@ import {
 } from "./shared/http/requestId.js";
 import { createRequestLogger } from "./shared/http/requestLogger.js";
 import { createErrorMiddleware } from "./shared/errors/handleError.js";
+import { CorsAllowlist } from "./shared/http/corsAllowlist.js";
 
 export async function createApp(env: BackendEnv, runtime: BackendRuntime) {
   const app = express();
+  const corsAllowlist = new CorsAllowlist(env.nodeEnv, env.corsOrigin);
 
   // Remove X-Powered-By header
   app.disable("x-powered-by");
@@ -55,9 +57,8 @@ export async function createApp(env: BackendEnv, runtime: BackendRuntime) {
   app.use((req: Request, res: Response, next: NextFunction) => {
     const origin = req.get("Origin");
 
-    const isAllowed =
-      env.corsOrigin.includes("*") ||
-      (origin && env.corsOrigin.includes(origin));
+    const hasWildcard = corsAllowlist.hasWildcard();
+    const isAllowed = origin ? corsAllowlist.isAllowed(origin) : false;
 
     // In production, actively reject disallowed origins with a 403.
     // Requests with no Origin header (server-to-server, curl) are allowed.
@@ -73,7 +74,7 @@ export async function createApp(env: BackendEnv, runtime: BackendRuntime) {
     if (isAllowed && origin) {
       res.set("Access-Control-Allow-Origin", origin);
       res.set("Vary", "Origin");
-    } else if (env.corsOrigin.includes("*")) {
+    } else if (hasWildcard) {
       res.set("Access-Control-Allow-Origin", "*");
     }
 
@@ -131,8 +132,6 @@ export async function createApp(env: BackendEnv, runtime: BackendRuntime) {
   // Request logging middleware (after request ID so requestId is available)
   app.use(createRequestLogger());
 
-  app.use(express.json({ limit: env.requestBodyLimit }));
-
   const authMiddleware = createAuthMiddleware(env.apiKey);
   const adminAuthMiddleware = requireApiKey(env.apiKey);
 
@@ -148,25 +147,66 @@ export async function createApp(env: BackendEnv, runtime: BackendRuntime) {
 
   const v1Router = express.Router();
 
-  v1Router.get("/jobs", adminAuthMiddleware, (_req, res) => {
-    const jobs = runtime.scheduledJobRunner.getJobStatuses();
-    res.status(200).json({ success: true, data: jobs });
+  v1Router.get("/admin/cors/origins", adminAuthMiddleware, (_req, res) => {
+    res.status(200).json({
+      success: true,
+      data: {
+        origins: corsAllowlist.list(),
+      },
+    });
   });
 
-  v1Router.post("/jobs/:name/trigger", adminAuthMiddleware, (req, res) => {
-    const name = String(req.params.name ?? "").trim();
-    const triggered = runtime.scheduledJobRunner.trigger(name);
+  v1Router.post("/admin/cors/origins", adminAuthMiddleware, (req, res) => {
+    const origin = String(req.body?.origin ?? "").trim();
 
-    if (!triggered) {
+    if (!origin) {
       error(res, {
-        message: `Job not found: ${name}`,
-        status: 404,
-        code: ErrorCode.NOT_FOUND,
+        message: "Bad Request: origin is required",
+        status: 400,
+        code: ErrorCode.VALIDATION_ERROR,
       });
       return;
     }
 
-    res.status(202).json({ success: true, data: { triggered: true } });
+    const added = corsAllowlist.add(origin);
+    if (added.reason) {
+      error(res, {
+        message: `Bad Request: ${added.reason}`,
+        status: 400,
+        code: ErrorCode.VALIDATION_ERROR,
+      });
+      return;
+    }
+
+    res.status(200).json({
+      success: true,
+      data: {
+        changed: added.changed,
+        origins: corsAllowlist.list(),
+      },
+    });
+  });
+
+  v1Router.delete("/admin/cors/origins", adminAuthMiddleware, (req, res) => {
+    const origin = String(req.body?.origin ?? "").trim();
+
+    if (!origin) {
+      error(res, {
+        message: "Bad Request: origin is required",
+        status: 400,
+        code: ErrorCode.VALIDATION_ERROR,
+      });
+      return;
+    }
+
+    const removed = corsAllowlist.remove(origin);
+    res.status(200).json({
+      success: true,
+      data: {
+        changed: removed,
+        origins: corsAllowlist.list(),
+      },
+    });
   });
 
   v1Router.use("/status", createStatusRouter(env, runtime));
@@ -178,6 +218,7 @@ export async function createApp(env: BackendEnv, runtime: BackendRuntime) {
   const registry = new (
     await import("./modules/contracts/contract-registry.js")
   ).default(env);
+
   // Sync lastIndexedLedger from running pollers
   if (runtime.eventPollingServices) {
     const ids =
@@ -192,13 +233,77 @@ export async function createApp(env: BackendEnv, runtime: BackendRuntime) {
       }
     }
   }
-  v1Router.use("/contracts", createContractsRouter(registry, adminAuthMiddleware));
+
+  const v1Router = express.Router();
+
+  v1Router.use("/status", createStatusRouter(env, runtime));
+  v1Router.use("/metrics", createMetricsRouter(runtime, adminAuthMiddleware));
+  v1Router.use("/health", createDetailedHealthRouter(env, runtime));
+
+  v1Router.get("/admin/config", adminAuthMiddleware, (_req, res) => {
+    success(res, {
+      nodeEnv: env.nodeEnv,
+      stellarNetwork: env.stellarNetwork,
+      sorobanRpcUrl: env.sorobanRpcUrl,
+      horizonUrl: env.horizonUrl,
+      websocketUrl: env.websocketUrl,
+      contractId: env.contractId,
+      contractIds: env.contractIds,
+      indexingParallelism: env.indexingParallelism,
+      eventPollingEnabled: env.eventPollingEnabled,
+      eventPollingIntervalMs: env.eventPollingIntervalMs,
+      duePaymentsJobEnabled: env.duePaymentsJobEnabled,
+      duePaymentsJobIntervalMs: env.duePaymentsJobIntervalMs,
+      cursorCleanupJobEnabled: env.cursorCleanupJobEnabled,
+      cursorCleanupJobIntervalMs: env.cursorCleanupJobIntervalMs,
+      cursorRetentionDays: env.cursorRetentionDays,
+      corsOrigin: env.corsOrigin,
+      requestBodyLimit: env.requestBodyLimit,
+      notificationsRequestBodyLimit: env.NOTIFICATIONS_REQUEST_BODY_LIMIT,
+      snapshotsRequestBodyLimit: env.SNAPSHOTS_REQUEST_BODY_LIMIT,
+      webhooksRequestBodyLimit: env.WEBHOOKS_REQUEST_BODY_LIMIT,
+      rateLimitEnabled: env.rateLimitEnabled,
+      rateLimitProposalsPerMin: env.rateLimitProposalsPerMin,
+      rateLimitExecutePerMin: env.rateLimitExecutePerMin,
+      rateLimitDefaultPerMin: env.rateLimitDefaultPerMin,
+    });
+  });
+
+  v1Router.use(
+    "/contracts",
+    createContractsRouter(registry, adminAuthMiddleware),
+  );
+
+  if (runtime.notificationQueue) {
+    v1Router.use(
+      "/notifications",
+      authMiddleware,
+      express.json({ limit: env.NOTIFICATIONS_REQUEST_BODY_LIMIT }),
+      createNotificationsRouter(runtime.notificationQueue),
+    );
+  }
+
+  if (runtime.webhookDeliveryService) {
+    v1Router.use(
+      "/webhooks",
+      authMiddleware,
+      express.json({ limit: env.WEBHOOKS_REQUEST_BODY_LIMIT }),
+      createWebhookRouter(runtime.webhookDeliveryService),
+    );
+  }
 
   v1Router.use(
     "/snapshots",
     authMiddleware,
-    createSnapshotRouter(runtime.snapshotService, adminAuthMiddleware, runtime.snapshotDiffService),
+    express.json({ limit: env.SNAPSHOTS_REQUEST_BODY_LIMIT }),
+    createSnapshotRouter(
+      runtime.snapshotService,
+      adminAuthMiddleware,
+      runtime.snapshotDiffService,
+    ),
   );
+
+  v1Router.use(express.json({ limit: env.requestBodyLimit }));
 
   v1Router.use(
     "/proposals",
@@ -212,7 +317,7 @@ export async function createApp(env: BackendEnv, runtime: BackendRuntime) {
   v1Router.use(
     "/recurring",
     authMiddleware,
-    createRecurringRouter(runtime.recurringIndexerService, authMiddleware),
+    createRecurringRouter(runtime.recurringIndexerService, authMiddleware, runtime.cacheManager),
   );
 
   v1Router.use(
@@ -221,23 +326,11 @@ export async function createApp(env: BackendEnv, runtime: BackendRuntime) {
     createTransactionsRouter(runtime.transactionsService, env.contractId),
   );
 
-  v1Router.use("/audit", authMiddleware, createAuditRouter(env.sorobanRpcUrl, adminAuthMiddleware));
-
-  if (runtime.notificationQueue) {
-    v1Router.use(
-      "/notifications",
-      authMiddleware,
-      createNotificationsRouter(runtime.notificationQueue),
-    );
-  }
-
-  if (runtime.webhookDeliveryService) {
-    v1Router.use(
-      "/webhooks",
-      authMiddleware,
-      createWebhookRouter(runtime.webhookDeliveryService),
-    );
-  }
+  v1Router.use(
+    "/audit",
+    authMiddleware,
+    createAuditRouter(env.sorobanRpcUrl, adminAuthMiddleware),
+  );
 
   if (runtime.cacheManager) {
     v1Router.use(
@@ -260,7 +353,9 @@ export async function createApp(env: BackendEnv, runtime: BackendRuntime) {
     futurenet: "Test SDF Future Network ; October 2022",
     standalone: "Standalone Network ; Latitude 0",
   };
-  const passphrase = networkPassphrases[env.stellarNetwork?.toLowerCase() ?? "testnet"] ?? networkPassphrases.testnet;
+  const passphrase =
+    networkPassphrases[env.stellarNetwork?.toLowerCase() ?? "testnet"] ??
+    networkPassphrases.testnet;
 
   v1Router.use(
     "/vault",

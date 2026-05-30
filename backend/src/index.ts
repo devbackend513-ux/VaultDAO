@@ -46,7 +46,6 @@ const unsubscribeNotificationBridge = notificationQueue.subscribe((event) => {
 
 // Start server and integrate with lifecycle management
 const { server, runtime } = await startServer(env, notificationQueue);
-const lifecycle = new LifecycleManager(server, 10_000); // 10s shutdown timeout
 
 realtimeServer.start(server);
 
