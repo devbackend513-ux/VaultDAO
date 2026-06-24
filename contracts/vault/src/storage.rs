@@ -27,9 +27,10 @@ use crate::types::{
     FeeStructure, FundingRound, FundingRoundConfig, GasConfig, GovernanceProposal, InsuranceConfig,
     ListMode, NotificationPreferences, PermissionGrant, Proposal, ProposalAmendment, ProposalStatus,
     ProposalTemplate, RecoveryProposal, Reputation, ReputationConfig, RetryState, Role,
-    RoleAssignment, ScopedDelegation, StakeRecord, StakingConfig, Subscription, SwapProposal,
-    SwapResult, TimeWeightedConfig, TokenLock, VaultMetrics, VelocityConfig, VotingStrategy,
-    BridgeConfig, CrossChainProposal,
+    HolidayCalendar, RoleAssignment, SignerTier, StakeRecord, StakingConfig, Subscription,
+    SwapProposal, SwapResult, VestingSchedule,
+    TimeWeightedConfig, TokenLock, VaultMetrics, VelocityConfig, VotingStrategy, BridgeConfig,
+    CrossChainProposal, DeadLetterRecord,
 };
 use crate::types_balance_snapshot::BalanceSnapshot;
 
@@ -126,6 +127,21 @@ pub enum CounterKey {
     ScopedDelegation = 8,
 }
 
+#[contracttype]
+#[derive(Clone)]
+pub enum VestingKey {
+    Schedule(u64),
+    NextId,
+    ActiveCount,
+    Reserved(Address),
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub enum CalendarKey {
+    Holidays,
+}
+
 /// Feature-specific storage keys (split to avoid enum size limits)
 #[contracttype]
 #[derive(Clone)]
@@ -184,6 +200,8 @@ pub enum FeatureKey {
     CrossVaultProposal(u64),
     /// Cross-vault configuration -> CrossVaultConfig
     CrossVaultConfig,
+    /// Bridge record by bridge ID -> BridgeRecord
+    BridgeRecord(soroban_sdk::BytesN<32>),
     /// Dispute by ID -> Dispute
     Dispute(u64),
     /// Disputes for a proposal -> Vec<u64>
@@ -234,24 +252,10 @@ pub enum FeatureKey {
     MetricsBucketIndex,
     /// Pending config change proposal ID -> u64
     PendingConfig,
-    /// Scoped delegation by ID -> ScopedDelegation
-    ScopedDelegation(u64),
-    /// Scoped delegation IDs by delegator -> Vec<u64>
-    ScopedDelegationsByDelegator(Address),
-    /// Balance snapshots -> Vec<BalanceSnapshot>
-    BalanceSnapshots,
-    /// Snapshot interval in ledgers -> u32
-    SnapshotInterval,
-    /// Last snapshot ledger -> u64
-    LastSnapshotLedger,
-    /// Governance proposal by ID -> GovernanceProposal
-    GovernanceProposal(u64),
-    /// Governance supermajority threshold (percentage) -> u32
-    GovernanceThreshold,
-    /// Active governance proposal count -> u32
-    ActiveGovernanceCount,
-    /// Next governance proposal ID -> u64
-    NextGovernanceId,
+    /// Moderator flag for an address -> bool
+    Moderator(Address),
+    /// Comment rate tracking: (proposal_id, author, day_number) -> u32
+    CommentRateCount(u64, Address, u64),
 }
 
 /// TTL constants (in ledgers, ~5 seconds each)
@@ -261,6 +265,114 @@ pub const INSTANCE_TTL: u32 = DAY_IN_LEDGERS * 30; // 30 days
 pub const INSTANCE_TTL_THRESHOLD: u32 = DAY_IN_LEDGERS * 7; // Extend when below 7 days
 pub const PERSISTENT_TTL: u32 = DAY_IN_LEDGERS * 30; // 30 days
 pub const PERSISTENT_TTL_THRESHOLD: u32 = DAY_IN_LEDGERS * 7; // Extend when below 7 days
+
+// ============================================================================
+// Signer tiers
+// ============================================================================
+
+pub fn set_signer_tier(env: &Env, signer: &Address, tier: &SignerTier) {
+    if let Some(mut config) = env.storage().instance().get::<_, Config>(&DataKey::Config) {
+        config.signer_tiers.set(signer.clone(), tier.clone());
+        env.storage().instance().set(&DataKey::Config, &config);
+    }
+}
+
+pub fn get_signer_tier(env: &Env, signer: &Address) -> SignerTier {
+    env.storage()
+        .instance()
+        .get::<_, Config>(&DataKey::Config)
+        .and_then(|config| config.signer_tiers.get(signer.clone()))
+        .unwrap_or(SignerTier::Principal)
+}
+
+pub fn set_full_quorum_threshold(env: &Env, threshold: i128) {
+    if let Some(mut config) = env.storage().instance().get::<_, Config>(&DataKey::Config) {
+        config.full_quorum_threshold = threshold;
+        env.storage().instance().set(&DataKey::Config, &config);
+    }
+}
+
+pub fn get_full_quorum_threshold(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get::<_, Config>(&DataKey::Config)
+        .map(|config| config.full_quorum_threshold)
+        .unwrap_or(0)
+}
+
+// ============================================================================
+// Vesting schedules
+// ============================================================================
+
+pub fn next_vesting_id(env: &Env) -> u64 {
+    let id = env
+        .storage()
+        .instance()
+        .get(&VestingKey::NextId)
+        .unwrap_or(1);
+    env.storage().instance().set(&VestingKey::NextId, &(id + 1));
+    id
+}
+
+pub fn set_vesting_schedule(env: &Env, schedule: &VestingSchedule) {
+    let key = VestingKey::Schedule(schedule.id);
+    env.storage().persistent().set(&key, schedule);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL);
+}
+
+pub fn get_vesting_schedule(env: &Env, id: u64) -> Option<VestingSchedule> {
+    env.storage().persistent().get(&VestingKey::Schedule(id))
+}
+
+pub fn get_active_vesting_count(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&VestingKey::ActiveCount)
+        .unwrap_or(0)
+}
+
+pub fn set_active_vesting_count(env: &Env, count: u32) {
+    env.storage().instance().set(&VestingKey::ActiveCount, &count);
+}
+
+pub fn get_reserved_vesting(env: &Env, token: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&VestingKey::Reserved(token.clone()))
+        .unwrap_or(0)
+}
+
+pub fn set_reserved_vesting(env: &Env, token: &Address, amount: i128) {
+    let key = VestingKey::Reserved(token.clone());
+    env.storage().persistent().set(&key, &amount);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL);
+}
+
+// ============================================================================
+// Holiday calendar
+// ============================================================================
+
+pub fn set_holiday_calendar(env: &Env, calendar: &HolidayCalendar) {
+    env.storage().persistent().set(&CalendarKey::Holidays, calendar);
+    env.storage().persistent().extend_ttl(
+        &CalendarKey::Holidays,
+        PERSISTENT_TTL_THRESHOLD,
+        PERSISTENT_TTL,
+    );
+}
+
+pub fn get_holiday_calendar(env: &Env) -> HolidayCalendar {
+    env.storage()
+        .persistent()
+        .get(&CalendarKey::Holidays)
+        .unwrap_or(HolidayCalendar {
+            holiday_ledgers: Vec::new(env),
+        })
+}
 
 // ============================================================================
 // Initialization
@@ -1692,6 +1804,20 @@ pub fn set_stake_record(env: &Env, record: &StakeRecord) {
         .extend_ttl(&key, INSTANCE_TTL_THRESHOLD, PROPOSAL_TTL);
 }
 
+pub fn get_bridge_record(env: &Env, bridge_id: soroban_sdk::BytesN<32>) -> Option<crate::types::BridgeRecord> {
+    env.storage()
+        .persistent()
+        .get(&FeatureKey::BridgeRecord(bridge_id))
+}
+
+pub fn set_bridge_record(env: &Env, record: &crate::types::BridgeRecord) {
+    let key = FeatureKey::BridgeRecord(record.bridge_id.clone());
+    env.storage().persistent().set(&key, record);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, INSTANCE_TTL_THRESHOLD, PROPOSAL_TTL);
+}
+
 pub fn get_permissions(env: &Env, addr: &Address) -> Vec<PermissionGrant> {
     env.storage()
         .persistent()
@@ -1901,6 +2027,37 @@ pub fn set_retry_state(env: &Env, proposal_id: u64, state: &RetryState) {
     env.storage()
         .persistent()
         .extend_ttl(&key, PROPOSAL_TTL / 2, PROPOSAL_TTL);
+}
+
+// ============================================================================
+// Dead Letter Queue
+// ============================================================================
+
+pub fn get_dead_letter(env: &Env, id: u64) -> Option<DeadLetterRecord> {
+    env.storage().persistent().get(&FeatureKey::DeadLetter(id))
+}
+
+pub fn set_dead_letter(env: &Env, record: &DeadLetterRecord) {
+    let key = FeatureKey::DeadLetter(record.id);
+    env.storage().persistent().set(&key, record);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL);
+}
+
+pub fn get_dead_letter_count(env: &Env) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&FeatureKey::DeadLetterCount)
+        .unwrap_or(0)
+}
+
+pub fn increment_dead_letter_count(env: &Env) -> u64 {
+    let count = get_dead_letter_count(env) + 1;
+    env.storage()
+        .persistent()
+        .set(&FeatureKey::DeadLetterCount, &count);
+    count
 }
 
 // ============================================================================
@@ -2620,148 +2777,67 @@ pub fn remove_delegator_index(env: &Env, delegate: &Address, delegator: &Address
 }
 
 // ============================================================================
-// Scoped Delegation (#1082)
+// Moderator Management (Issue #1076)
 // ============================================================================
 
-pub fn get_next_scoped_delegation_id(env: &Env) -> u64 {
-    env.storage()
-        .instance()
-        .get(&FeatureKey::Counter(CounterKey::ScopedDelegation))
-        .unwrap_or(1)
-}
-
-pub fn increment_scoped_delegation_id(env: &Env) -> u64 {
-    let id = get_next_scoped_delegation_id(env);
-    env.storage()
-        .instance()
-        .set(&FeatureKey::Counter(CounterKey::ScopedDelegation), &(id + 1));
-    id
-}
-
-pub fn set_scoped_delegation(env: &Env, d: &ScopedDelegation) {
-    let key = FeatureKey::ScopedDelegation(d.id);
-    env.storage().persistent().set(&key, d);
-    env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL);
-}
-
-pub fn get_scoped_delegation(env: &Env, id: u64) -> Option<ScopedDelegation> {
-    env.storage().persistent().get(&FeatureKey::ScopedDelegation(id))
-}
-
-pub fn get_scoped_delegations_by_delegator(env: &Env, delegator: &Address) -> Vec<u64> {
+/// Check if an address has the Moderator sub-role.
+pub fn is_moderator(env: &Env, addr: &Address) -> bool {
     env.storage()
         .persistent()
-        .get(&FeatureKey::ScopedDelegationsByDelegator(delegator.clone()))
-        .unwrap_or_else(|| Vec::new(env))
+        .get(&FeatureKey::Moderator(addr.clone()))
+        .unwrap_or(false)
 }
 
-pub fn set_scoped_delegations_by_delegator(env: &Env, delegator: &Address, ids: &Vec<u64>) {
-    let key = FeatureKey::ScopedDelegationsByDelegator(delegator.clone());
-    env.storage().persistent().set(&key, ids);
-    env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL);
+/// Set or remove the Moderator sub-role for an address.
+pub fn set_moderator(env: &Env, addr: &Address, is_mod: bool) {
+    if is_mod {
+        env.storage()
+            .persistent()
+            .set(&FeatureKey::Moderator(addr.clone()), &true);
+        env.storage().persistent().extend_ttl(
+            &FeatureKey::Moderator(addr.clone()),
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL,
+        );
+    } else {
+        env.storage()
+            .persistent()
+            .remove(&FeatureKey::Moderator(addr.clone()));
+    }
 }
 
 // ============================================================================
-// Balance Snapshots (#1080)
+// Comment Rate Limiting (Issue #1076)
 // ============================================================================
 
-const MAX_SNAPSHOTS: u32 = 90;
+/// Get the comment count for a signer on a proposal for a given day.
+pub fn get_comment_rate_count(env: &Env, proposal_id: u64, author: &Address, day: u64) -> u32 {
+    env.storage()
+        .temporary()
+        .get(&FeatureKey::CommentRateCount(proposal_id, author.clone(), day))
+        .unwrap_or(0)
+}
 
-pub fn get_snapshots(env: &Env) -> Vec<BalanceSnapshot> {
+/// Increment the comment count for a signer on a proposal for a given day.
+pub fn increment_comment_rate_count(env: &Env, proposal_id: u64, author: &Address, day: u64) {
+    let key = FeatureKey::CommentRateCount(proposal_id, author.clone(), day);
+    let count: u32 = env.storage().temporary().get(&key).unwrap_or(0);
+    env.storage().temporary().set(&key, &(count + 1));
+    // TTL of 2 days to cover edge cases spanning two ledger epochs
+    env.storage()
+        .temporary()
+        .extend_ttl(&key, DAY_IN_LEDGERS, DAY_IN_LEDGERS * 2);
+}
+
+// ============================================================================
+// Expired Proposal TTL Reduction (Issue #1062)
+// ============================================================================
+
+/// Reduce TTL for an expired proposal to reclaim ledger rent sooner.
+pub fn reduce_expired_proposal_ttl(env: &Env, proposal_id: u64) {
+    let key = DataKey::Proposal(proposal_id);
+    // Set a short TTL (1 day) for expired proposals instead of the default 7 days
     env.storage()
         .persistent()
-        .get(&FeatureKey::BalanceSnapshots)
-        .unwrap_or_else(|| Vec::new(env))
-}
-
-pub fn add_snapshot(env: &Env, snapshot: &BalanceSnapshot) {
-    let mut snapshots = get_snapshots(env);
-    if snapshots.len() >= MAX_SNAPSHOTS {
-        snapshots.remove(0);
-    }
-    snapshots.push_back(snapshot.clone());
-    let key = FeatureKey::BalanceSnapshots;
-    env.storage().persistent().set(&key, &snapshots);
-    env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL);
-
-    env.storage().persistent().set(&FeatureKey::LastSnapshotLedger, &snapshot.ledger);
-}
-
-pub fn get_last_snapshot_ledger(env: &Env) -> u64 {
-    env.storage().persistent().get(&FeatureKey::LastSnapshotLedger).unwrap_or(0)
-}
-
-pub fn get_snapshot_interval(env: &Env) -> u32 {
-    env.storage().instance().get(&FeatureKey::SnapshotInterval).unwrap_or(0)
-}
-
-pub fn set_snapshot_interval(env: &Env, interval: u32) {
-    env.storage().instance().set(&FeatureKey::SnapshotInterval, &interval);
-}
-
-pub fn get_snapshot_at(env: &Env, target_ledger: u32) -> Option<BalanceSnapshot> {
-    let snapshots = get_snapshots(env);
-    let len = snapshots.len();
-    if len == 0 {
-        return None;
-    }
-    // Binary search for nearest snapshot at or before target_ledger
-    let target = target_ledger as u64;
-    let mut lo: u32 = 0;
-    let mut hi: u32 = len - 1;
-    let mut best: Option<BalanceSnapshot> = None;
-
-    while lo <= hi {
-        let mid = lo + (hi - lo) / 2;
-        let snap = snapshots.get(mid).unwrap();
-        if snap.ledger <= target {
-            best = Some(snap);
-            if mid == hi { break; }
-            lo = mid + 1;
-        } else {
-            if mid == 0 { break; }
-            hi = mid - 1;
-        }
-    }
-    best
-}
-
-// ============================================================================
-// Governance Proposals (#1068)
-// ============================================================================
-
-pub fn get_next_governance_id(env: &Env) -> u64 {
-    env.storage().instance().get(&FeatureKey::NextGovernanceId).unwrap_or(1)
-}
-
-pub fn increment_governance_id(env: &Env) -> u64 {
-    let id = get_next_governance_id(env);
-    env.storage().instance().set(&FeatureKey::NextGovernanceId, &(id + 1));
-    id
-}
-
-pub fn get_governance_proposal(env: &Env, id: u64) -> Option<GovernanceProposal> {
-    env.storage().persistent().get(&FeatureKey::GovernanceProposal(id))
-}
-
-pub fn set_governance_proposal(env: &Env, gp: &GovernanceProposal) {
-    let key = FeatureKey::GovernanceProposal(gp.id);
-    env.storage().persistent().set(&key, gp);
-    env.storage().persistent().extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL);
-}
-
-pub fn get_governance_threshold(env: &Env) -> u32 {
-    env.storage().instance().get(&FeatureKey::GovernanceThreshold).unwrap_or(67)
-}
-
-pub fn set_governance_threshold(env: &Env, threshold: u32) {
-    env.storage().instance().set(&FeatureKey::GovernanceThreshold, &threshold);
-}
-
-pub fn get_active_governance_count(env: &Env) -> u32 {
-    env.storage().instance().get(&FeatureKey::ActiveGovernanceCount).unwrap_or(0)
-}
-
-pub fn set_active_governance_count(env: &Env, count: u32) {
-    env.storage().instance().set(&FeatureKey::ActiveGovernanceCount, &count);
+        .extend_ttl(&key, DAY_IN_LEDGERS / 2, DAY_IN_LEDGERS);
 }
