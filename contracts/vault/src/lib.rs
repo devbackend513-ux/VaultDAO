@@ -126,6 +126,12 @@ mod test_retry;
 mod test_staking;
 #[cfg(test)]
 mod test_fees;
+#[cfg(test)]
+mod test_fingerprint;
+#[cfg(test)]
+mod test_pause_circuit_breaker;
+#[cfg(test)]
+mod test_compliance;
 
 
 #[cfg(test)]
