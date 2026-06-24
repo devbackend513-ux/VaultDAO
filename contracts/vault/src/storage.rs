@@ -24,14 +24,15 @@ use crate::errors::VaultError;
 use crate::types::{
     AuditEntry, BatchExecutionResult, BatchTransaction, Comment, Config, DelegatedPermission,
     Delegation, DelegationHistory, DexConfig, Escrow, ExecutionFeeEstimate, ExecutionSnapshot,
-    FeeStructure, FundingRound, FundingRoundConfig, GasConfig, InsuranceConfig, ListMode,
-    NotificationPreferences, PermissionGrant, Proposal, ProposalAmendment, ProposalStatus,
+    FeeStructure, FundingRound, FundingRoundConfig, GasConfig, GovernanceProposal, InsuranceConfig,
+    ListMode, NotificationPreferences, PermissionGrant, Proposal, ProposalAmendment, ProposalStatus,
     ProposalTemplate, RecoveryProposal, Reputation, ReputationConfig, RetryState, Role,
     HolidayCalendar, RoleAssignment, SignerTier, StakeRecord, StakingConfig, Subscription,
     SwapProposal, SwapResult, VestingSchedule,
     TimeWeightedConfig, TokenLock, VaultMetrics, VelocityConfig, VotingStrategy, BridgeConfig,
     CrossChainProposal, DeadLetterRecord,
 };
+use crate::types_balance_snapshot::BalanceSnapshot;
 
 /// Core storage key definitions (kept minimal to avoid size limits)
 #[contracttype]
@@ -123,6 +124,7 @@ pub enum CounterKey {
     Recovery = 5,
     FundingRound = 6,
     Batch = 7,
+    ScopedDelegation = 8,
 }
 
 #[contracttype]
